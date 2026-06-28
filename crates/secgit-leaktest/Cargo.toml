@@ -1,0 +1,15 @@
+[package]
+name = "secgit-leaktest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Reusable confidentiality leak-test harness: assert plaintext never reaches operator-visible surfaces (disk, wire)."
+
+[dependencies]
+hex.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

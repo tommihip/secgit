@@ -1,0 +1,12 @@
+[package]
+name = "secgit-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal audited outbound HTTPS client (rustls + aws-lc-rs) for in-CVM/non-secret fetches"
+
+[dependencies]
+anyhow.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true

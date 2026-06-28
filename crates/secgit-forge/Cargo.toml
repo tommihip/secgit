@@ -1,0 +1,15 @@
+[package]
+name = "secgit-forge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal Rust forge: gix for reads, git CLI as the pack engine"
+
+[dependencies]
+secgit-store.workspace = true
+gix.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+secgit-crypto.workspace = true

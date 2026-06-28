@@ -1,0 +1,16 @@
+[package]
+name = "secgit-sso"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Enterprise SSO (SAML 2.0 SP) and SCIM 2.0 provisioning for SecGit, rendered inside the CVM"
+
+[dependencies]
+secgit-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+aws-lc-rs.workspace = true
+x509-cert.workspace = true

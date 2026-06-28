@@ -1,0 +1,38 @@
+[package]
+name = "secgit-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The SecGit server binary, designed to run inside a confidential VM"
+
+[[bin]]
+name = "secgit-server"
+path = "src/main.rs"
+
+[dependencies]
+secgit-crypto.workspace = true
+secgit-net.workspace = true
+secgit-attest.workspace = true
+secgit-keybroker.workspace = true
+secgit-store.workspace = true
+secgit-audit.workspace = true
+secgit-identity.workspace = true
+secgit-forge.workspace = true
+secgit-git.workspace = true
+secgit-api.workspace = true
+secgit-import.workspace = true
+secgit-review.workspace = true
+secgit-search.workspace = true
+secgit-sso.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+secgit-leaktest.workspace = true

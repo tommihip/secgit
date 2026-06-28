@@ -1,0 +1,15 @@
+[package]
+name = "secgit-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Crypto-agility core for SecGit: versioned envelopes, hybrid PQC primitives"
+
+[dependencies]
+aws-lc-rs.workspace = true
+x25519-dalek.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+hex.workspace = true

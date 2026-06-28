@@ -1,0 +1,22 @@
+[package]
+name = "secgit-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "In-CVM code search: an inverted index persisted encrypted-at-rest, with access-controlled querying at the server layer."
+
+[dependencies]
+secgit-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+secgit-crypto.workspace = true
+secgit-leaktest.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

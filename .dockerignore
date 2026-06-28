@@ -1,0 +1,14 @@
+# Keep the build context minimal and deterministic. The image is built from source +
+# Cargo.lock only; build outputs and local state must never leak into it.
+target/
+**/target/
+.git/
+.github/
+*.log
+sbom.json
+image-manifest.json
+# Local data / secrets that must never enter an image layer.
+data/
+*.kek
+*.key
+.env

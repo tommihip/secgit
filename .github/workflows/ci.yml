@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Reproducible-build hygiene (see docs/adr/0005-reproducible-builds.md).
+  SOURCE_DATE_EPOCH: "1700000000"
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify DCO sign-off on all PR commits
+        if: github.event_name == 'pull_request'
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          missing=0
+          for c in $(git rev-list "$base..$head"); do
+            if ! git log -1 --format='%b' "$c" | grep -qi '^Signed-off-by:'; then
+              echo "::error::commit $c missing Signed-off-by (DCO)"
+              missing=1
+            fi
+          done
+          exit $missing
+
+  build-test:
+    # ubuntu = the real Linux/AMD target (still mock TEE in CI: no SEV-SNP silicon here).
+    # macos-latest = arm64; the native mock/dev path (docs/dev-macos.md). The macOS leg
+    # proves the platform-gated build compiles + runs without SEV-SNP, never weakening the
+    # real Linux path (which is byte-for-byte identical behind #[cfg(target_os = "linux")]).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # aws-lc-rs builds from C: clang ships on both runners; ensure CMake is present.
+      - name: Ensure CMake (macOS)
+        if: runner.os == 'macOS'
+        run: cmake --version || brew install cmake
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: build
+        run: cargo build --workspace --locked
+      - name: test
+        run: cargo test --workspace --locked
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Mock-path runtime smoke checks (no silicon required on either OS).
+      - name: selftest
+        run: cargo run -p secgit-verify -- selftest
+      - name: acceptance-snp (mock)
+        run: cargo run -p secgit-verify -- acceptance-snp --mock
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      # Enforces license hygiene AND the provider-neutrality ban-list
+      # (no cloud attestation crates may enter the tree).
+      - name: cargo deny
+        run: cargo deny check

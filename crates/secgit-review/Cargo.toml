@@ -1,0 +1,22 @@
+[package]
+name = "secgit-review"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pull-request / code-review workflow engine (review threads, approvals, status checks, protected branches), persisted encrypted-at-rest."
+
+[dependencies]
+secgit-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+secgit-crypto.workspace = true
+secgit-leaktest.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

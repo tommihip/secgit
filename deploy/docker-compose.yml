@@ -1,0 +1,51 @@
+# SecGit, packaged to run inside a confidential VM (CVM).
+#
+# The compose file itself runs the container; the *host* is expected to be a
+# confidential VM (AMD SEV-SNP / Intel TDX) so that the whole guest — including this
+# container — is memory-encrypted and attestable. The container reads attestation
+# evidence from the guest via configfs-tsm (mounted below); there is deliberately NO
+# cloud-attestation sidecar.
+
+services:
+  secgit:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: secgit/secgit-server:dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SECGIT_ADDR: "0.0.0.0:8080"
+      SECGIT_DATA: "/data"
+      # Provide a persistent dev KEK ONLY for local non-confidential testing. In a real
+      # CVM the KEK is released by the attestation-gated key broker, never set here.
+      # SECGIT_DEV_KEK_HEX: "<64 hex chars>"
+    volumes:
+      - secgit-data:/data
+      # configfs-tsm: cross-vendor attestation report interface (kernel 6.7+).
+      # Present only on real SEV-SNP/TDX guests; harmless to attempt elsewhere.
+      - /sys/kernel/config/tsm/report:/sys/kernel/config/tsm/report
+    # SEV-SNP/TDX guest device for fetching attestation reports, when available.
+    devices:
+      - "/dev/sev-guest:/dev/sev-guest"
+    # Defense-in-depth: the only secret (KEK) lives in memory; the rest of the FS can be
+    # read-only with writable state confined to the encrypted /data volume.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/secgit
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/secgit-verify", "selftest"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  secgit-data:

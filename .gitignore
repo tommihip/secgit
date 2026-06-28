@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+/.probe
+# Local dev state (encrypted repo stores, keys, sandbox data)
+/.secgit-data
+*.kek
+*.dek

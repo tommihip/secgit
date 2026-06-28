@@ -1,0 +1,9 @@
+{
+  "_comment": "Launch-context inputs for the reproducible SEV-SNP launch measurement. Copy to snp-inputs.json and point every field at the EXACT published build artifacts, then run: cargo run -p xtask -- snp-measure --inputs snp-inputs.json --log transparency.log. The append string MUST be byte-identical to the cmdline the CVM boots with.",
+  "ovmf": "OVMF.fd",
+  "kernel": "vmlinuz",
+  "initrd": "initrd.img",
+  "append": "console=ttyS0 root=/dev/vda1 ro",
+  "vcpus": 4,
+  "vcpu_type": "EPYC-v4"
+}

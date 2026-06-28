@@ -1,0 +1,19 @@
+[package]
+name = "secgit-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Identity model (User->Org->Repo) and pluggable auth (OIDC + local)"
+
+[dependencies]
+secgit-crypto.workspace = true
+secgit-store.workspace = true
+aws-lc-rs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+secgit-leaktest.workspace = true

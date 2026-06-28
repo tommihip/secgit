@@ -1,0 +1,15 @@
+[package]
+name = "secgit-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Encrypted-at-rest object store (per-repo DEK wrapped by the KEK)"
+
+[dependencies]
+secgit-crypto.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+secgit-leaktest.workspace = true

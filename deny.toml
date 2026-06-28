@@ -1,0 +1,97 @@
+# cargo-deny configuration for SecGit.
+#
+# Two jobs that matter for the wedge:
+#   1. License hygiene for a clean AGPL-class core and a future spin-out.
+#   2. The provider-neutrality invariant: NO cloud-specific attestation
+#      dependency may ever enter the tree (no Azure vTPM / MAA / IMDS paths).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# aws-lc-rs exposes ML-DSA via an `unstable` API today; track this.
+ignore = []
+
+[licenses]
+version = 2
+# Spin-out-safe allow-list. aws-lc / aws-lc-sys relicensed to Apache-2.0 (Mar 2026),
+# removing the old OpenSSL advertising-clause / AGPL-incompatibility concern.
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # File-level copyleft, OSI/FSF-approved and AGPL-compatible (MPL 2.0 §3.3).
+    # Only present transitively via gitoxide (uluru LRU cache under gix-pack).
+    "MPL-2.0",
+    # Permissive data license covering the Mozilla CA root bundle shipped by
+    # webpki-roots (used only for outbound HTTPS to AMD KDS / self-hosted KBS).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+# === PROVIDER-NEUTRALITY INVARIANT ===
+# Forbid any cloud-specific attestation dependency anywhere in the dependency graph.
+# We attest against CPU-vendor roots only (AMD KDS / Intel DCAP), via configfs-tsm.
+deny = [
+    { name = "az-snp-vtpm" },
+    { name = "az-tdx-vtpm" },
+    { name = "az-cvm-vtpm" },
+    { name = "azure-guest-attestation-sdk" },
+    { name = "azure-tpm" },
+    # No SaaS attestation clients / cloud metadata SDKs in the trust path.
+    { name = "aws-sdk-kms" },
+    { name = "google-cloud-kms" },
+
+    # === "NO AI TRAINING" INVARIANT (see docs/no-ai-training.md) ===
+    # The confidential plaintext never leaves the TEE and is never fed to an ML/training
+    # pipeline. Enforce that as a build-time fact: no ML/inference/training framework or
+    # vector/embedding crate may enter the dependency graph of the server that handles
+    # plaintext. (Tooling/telemetry SDKs that could exfiltrate are likewise excluded.)
+    { name = "tch" },                 # libtorch bindings
+    { name = "torch-sys" },
+    { name = "tensorflow" },
+    { name = "tensorflow-sys" },
+    { name = "onnxruntime" },
+    { name = "onnxruntime-sys" },
+    { name = "ort" },                 # ONNX Runtime
+    { name = "candle-core" },         # HF candle
+    { name = "candle-nn" },
+    { name = "candle-transformers" },
+    { name = "llm" },
+    { name = "llama-cpp-2" },
+    { name = "llama_cpp" },
+    { name = "burn" },                # Burn DL framework
+    { name = "dfdx" },                # dfdx tensors/autodiff
+    { name = "linfa" },              # classical ML
+    { name = "smartcore" },           # classical ML
+    { name = "rust-bert" },
+    { name = "tokenizers" },          # LLM tokenizers
+    { name = "tiktoken-rs" },
+    { name = "openai-api-rs" },       # outbound LLM API clients
+    { name = "async-openai" },
+    { name = "qdrant-client" },       # vector DBs / embeddings stores
+    { name = "pinecone-sdk" },
+    # Telemetry/analytics SDKs that could exfiltrate plaintext or metadata off-box.
+    { name = "sentry" },
+    { name = "opentelemetry-otlp" },
+    { name = "segment" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+[sources.allow-org]
+github = []

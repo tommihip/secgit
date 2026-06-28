@@ -1,0 +1,16 @@
+[package]
+name = "secgit-attest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Provider-neutral remote attestation (configfs-tsm; AMD/Intel vendor roots)"
+
+[dependencies]
+secgit-crypto.workspace = true
+aws-lc-rs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+x509-cert.workspace = true

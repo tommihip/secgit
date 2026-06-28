@@ -1,0 +1,14 @@
+[package]
+name = "secgit-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Framework-agnostic API logic: sandbox tiers, ephemeral repos, abuse controls"
+
+[dependencies]
+secgit-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true

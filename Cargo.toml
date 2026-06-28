@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/secgit-crypto",
+    "crates/secgit-net",
+    "crates/secgit-attest",
+    "crates/secgit-keybroker",
+    "crates/secgit-store",
+    "crates/secgit-audit",
+    "crates/secgit-identity",
+    "crates/secgit-forge",
+    "crates/secgit-git",
+    "crates/secgit-api",
+    "crates/secgit-leaktest",
+    "crates/secgit-import",
+    "crates/secgit-review",
+    "crates/secgit-search",
+    "crates/secgit-sso",
+    "crates/secgit-verify",
+    "bins/secgit-server",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+authors = ["SecGit Contributors"]
+repository = "https://github.com/secgit/secgit"
+description = "Confidential, attestation-backed, post-quantum private code hosting"
+
+[workspace.dependencies]
+# The ONE conscious exception to the all-Rust preference: audited, C-backed PQC.
+# ML-KEM-768, AES-256-GCM, ChaCha20-Poly1305, Ed25519, ML-DSA (unstable), digests.
+aws-lc-rs = { version = "1.17", features = ["unstable"] }
+# Classical half of the hybrid KEM (recipient-static X25519 ergonomics).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+# Read-side git plumbing. NOTE: gitoxide has no server-side receive-pack and only a
+# nascent upload-pack; transfer is handled by shelling out to canonical `git`.
+gix = "0.66"
+
+# In-CVM PQC-TLS termination. rustls default features include the aws-lc-rs provider
+# and `prefer-post-quantum`, making X25519MLKEM768 the highest-priority key exchange
+# (verified against rustls 0.23 manual, June 2026). Termination happens INSIDE the CVM
+# (see docs/adr/0007-deployment.md) so no operator-visible plaintext hop exists.
+rustls = "0.23"
+rustls-pemfile = "2"
+# Mozilla CA roots (pure data) for the server's OUTBOUND HTTPS clients (AMD KDS VCEK
+# fetch, self-hosted KBS). Note: KEK confidentiality does not rely on this channel — the
+# KEK is KEM-sealed to the TEE pubkey — so these roots authenticate, they don't gate.
+webpki-roots = "0.26"
+
+# Pure-Rust X.509 parsing for the AMD ARK->ASK->VCEK chain. Parsing only; all signature
+# verification is done by aws-lc-rs (no OpenSSL, no ring).
+x509-cert = { version = "0.2", features = ["pem"] }
+# Self-signed leaf generation for the attestation-pinned TLS cert. aws_lc_rs backend
+# only (no ring) to keep one C-crypto stack.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+# Internal crates
+secgit-crypto = { path = "crates/secgit-crypto" }
+secgit-net = { path = "crates/secgit-net" }
+secgit-attest = { path = "crates/secgit-attest" }
+secgit-keybroker = { path = "crates/secgit-keybroker" }
+secgit-store = { path = "crates/secgit-store" }
+secgit-audit = { path = "crates/secgit-audit" }
+secgit-identity = { path = "crates/secgit-identity" }
+secgit-forge = { path = "crates/secgit-forge" }
+secgit-git = { path = "crates/secgit-git" }
+secgit-api = { path = "crates/secgit-api" }
+secgit-leaktest = { path = "crates/secgit-leaktest" }
+secgit-import = { path = "crates/secgit-import" }
+secgit-review = { path = "crates/secgit-review" }
+secgit-search = { path = "crates/secgit-search" }
+secgit-sso = { path = "crates/secgit-sso" }
+
+[profile.release]
+# Reproducible-build friendliness (see xtask + docs/adr/0005-reproducible-builds.md).
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,10 @@
+[package]
+name = "secgit-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Git smart-HTTP wire handlers (shell out to git-upload-pack/receive-pack)"
+
+[dependencies]
+thiserror.workspace = true
