@@ -12,7 +12,28 @@ all-features = true
 version = 2
 yanked = "deny"
 # aws-lc-rs exposes ML-DSA via an `unstable` API today; track this.
-ignore = []
+#
+# Transitive advisories accepted for now (all from the pre-1.0 gitoxide stack we pin
+# at gix 0.66, plus one unmaintained leaf). Each is justified against the as-built
+# threat model; the proper fix is bumping gix to a current release + migrating off
+# rustls-pemfile, tracked as a follow-up (see the [VERIFY] gitoxide markers and
+# docs/STATUS.md). Re-audit on every gix bump and drop entries that no longer apply.
+ignore = [
+    # gix-worktree-state nonexclusive checkout sets executable files world-writable.
+    # SecGit operates on bare repos sealed inside the TEE and does not perform shared
+    # filesystem worktree checkouts on the host, so the exposure does not apply.
+    "RUSTSEC-2025-0001",
+    # SHA-1 collision attacks are not detected by gitoxide's hasher. This matches
+    # stock git's object-hash behavior; SecGit's integrity guarantees come from the
+    # PQC-signed transparency log (secgit-audit), not from SHA-1 collision resistance.
+    "RUSTSEC-2025-0021",
+    # Non-utf8 String can be created via gix `TimeBuf::as_str`. Low severity; the
+    # affected date-formatting path is not on SecGit's trust-critical surface.
+    "RUSTSEC-2025-0140",
+    # rustls-pemfile is unmaintained (its API moved into rustls-pki-types). No known
+    # vulnerability; used only to parse the in-CVM self-signed cert/key at startup.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2
