@@ -27,7 +27,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
 authors = ["SecGit Contributors"]
-repository = "https://github.com/secgit/secgit"
+repository = "https://github.com/tommihip/secgit"
 description = "Confidential, attestation-backed, post-quantum private code hosting"
 
 [workspace.dependencies]
