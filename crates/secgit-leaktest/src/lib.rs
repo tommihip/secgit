@@ -51,8 +51,8 @@ impl Canary {
         // Low bits: unpredictable per-call entropy (addr/pid/clock). High bits: the monotonic
         // sequence, which occupies bit 96+ (above where addr, pid<<64, and the added nanos land)
         // so two calls always differ even when every other input repeats.
-        let raw = (((addr as u128) ^ ((pid as u128) << 64)).wrapping_add(nanos))
-            ^ ((seq as u128) << 96);
+        let raw =
+            (((addr as u128) ^ ((pid as u128) << 64)).wrapping_add(nanos)) ^ ((seq as u128) << 96);
         Self {
             value: format!("SECGIT-CANARY-{label}-{:032x}", raw),
         }
@@ -161,7 +161,11 @@ mod tests {
         for _ in 0..n {
             let c = Canary::new("repo");
             assert!(c.as_str().starts_with("SECGIT-CANARY-repo-"));
-            assert!(seen.insert(c.value.clone()), "duplicate canary: {}", c.as_str());
+            assert!(
+                seen.insert(c.value.clone()),
+                "duplicate canary: {}",
+                c.as_str()
+            );
         }
     }
 
