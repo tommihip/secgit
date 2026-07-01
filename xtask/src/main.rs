@@ -41,10 +41,32 @@ struct SnpMeasureParams {
     append: Option<String>,
     vcpus: Option<u32>,
     vcpu_type: Option<String>,
+    /// How the guest is launched, recorded so the predicted side matches the launcher.
+    /// e.g. `sev-snp-measure-direct-boot` (OVMF + kernel-hashes) vs an IGVM path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vmm_launch_method: Option<String>,
+    /// Path to the pinned OVMF firmware provenance (`deploy/guest/ovmf.pin.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ovmf_pin: Option<String>,
+    /// The launch-input artifacts, each with its pinned SHA-384. `snp-measure` recomputes
+    /// these from the files on disk and refuses to emit a reference on any mismatch, so the
+    /// measurement is bound to the exact bytes (not an abstract path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expected_artifacts: Vec<ExpectedArtifact>,
+}
+
+/// A pinned launch-input artifact (OVMF / UKI / kernel / initrd) with its expected digest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpectedArtifact {
+    role: String,
+    path: String,
+    sha384_hex: String,
 }
 
 /// A published, transparency-logged reference launch measurement that the verifier pins
-/// into `Policy.allowed_measurements`.
+/// into `Policy.allowed_measurements`. Commit-bound: it names the exact source revision and
+/// the recomputed digests of every launch input, so a third party can rebuild from that
+/// commit and confirm the reference themselves.
 #[derive(Serialize, Deserialize)]
 struct SnpReference {
     measurement_hex: String,
@@ -52,6 +74,15 @@ struct SnpReference {
     params: SnpMeasureParams,
     tool: String,
     note: String,
+    /// The source git commit the reference was produced from (`git rev-parse HEAD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_commit: Option<String>,
+    /// The launcher method this measurement corresponds to (mirrors `params`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vmm_launch_method: Option<String>,
+    /// Recomputed digests of the launch inputs that were present on disk at reference time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    launch_artifacts: Vec<ArtifactDigest>,
 }
 
 /// Crates whose presence in the dependency graph would contradict the "no AI training"
@@ -98,6 +129,8 @@ fn main() -> Result<()> {
         Some("egress-check") => egress_check("Cargo.lock"),
         Some("sbom") => sbom(&args[2..]),
         Some("snp-measure") => snp_measure(&args[2..]),
+        Some("provenance") => provenance(&args[2..]),
+        Some("provenance-keygen") => provenance_keygen(&args[2..]),
         _ => {
             eprintln!("xtask <command>");
             eprintln!("  measure <artifact>...                     -> writes image-manifest.json");
@@ -108,11 +141,303 @@ fn main() -> Result<()> {
             eprintln!(
                 "  snp-measure [--inputs snp-inputs.json] [--ovmf f --kernel f --initrd f --append s --vcpus n --vcpu-type t]"
             );
-            eprintln!("              [--measurement HEX] [--log path] [--out snp-reference.json]");
-            eprintln!("                                            -> compute/record SNP launch measurement");
+            eprintln!("              [--measurement HEX] [--image-manifest image-manifest.json] [--log path] [--out snp-reference.json]");
+            eprintln!("                                            -> compute/record a commit-bound SNP launch measurement");
+            eprintln!(
+                "  provenance --reference snp-reference.json [--image-manifest m.json] [--sbom sbom.json]"
+            );
+            eprintln!(
+                "             [--oci-image-digest sha256:HEX] [--out provenance.json] [--log path]"
+            );
+            eprintln!("                                            -> PQC-sign an in-toto/SLSA provenance statement");
+            eprintln!(
+                "  provenance-keygen [--bundle-out f] [--vk-out deploy/provenance.vk.json] [--force]"
+            );
+            eprintln!("                                            -> offline ceremony: long-lived hybrid PQC signing key + published vk");
             std::process::exit(2);
         }
     }
+}
+
+/// An in-toto Statement subject: a named artifact and its content digest(s). Digest keys are
+/// algorithm names (`sha256`/`sha384`) mapping to lowercase hex, per the in-toto spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Subject {
+    name: String,
+    digest: std::collections::BTreeMap<String, String>,
+}
+
+/// The SecGit build predicate: the facts that let a verifier tie the published artifact set to
+/// the reproducible OSS build and the attestable CVM launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvenancePredicate {
+    build_type: String,
+    builder_id: String,
+    snp_measurement_hex: String,
+    vmm_launch_method: String,
+    git_commit: String,
+    source_date_epoch: String,
+}
+
+/// A minimal in-toto v1 Statement over the SecGit artifact set. Signed with the long-lived
+/// hybrid PQC key; the canonical signed bytes are `serde_json::to_vec(&Statement)` (compact,
+/// struct-field order), so a verifier reconstructs them by parsing and re-serializing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvenanceStatement {
+    #[serde(rename = "_type")]
+    type_: String,
+    predicate_type: String,
+    subject: Vec<Subject>,
+    predicate: ProvenancePredicate,
+}
+
+fn digest_map(alg: &str, hex_val: &str) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(alg.to_string(), hex_val.to_lowercase());
+    m
+}
+
+/// PQC-sign an in-toto/SLSA-style provenance statement binding the OCI image, the guest launch
+/// artifacts (OVMF + UKI), the SBOM, and the predicted SNP measurement to a git commit. No
+/// external transparency service (no sigstore/Fulcio/Rekor): the signature is our hybrid PQC
+/// signature and the statement is (optionally) anchored in OUR transparency log.
+fn provenance(args: &[String]) -> Result<()> {
+    let mut reference_path: Option<String> = None;
+    let mut image_manifest_path: Option<String> = None;
+    let mut sbom_path: Option<String> = None;
+    let mut oci_image_digest: Option<String> = None;
+    let mut out = "provenance.json".to_string();
+    let mut log_path: Option<String> = None;
+
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let mut val = || -> Result<String> {
+            it.next()
+                .cloned()
+                .with_context(|| format!("flag {flag} needs a value"))
+        };
+        match flag.as_str() {
+            "--reference" => reference_path = Some(val()?),
+            "--image-manifest" => image_manifest_path = Some(val()?),
+            "--sbom" => sbom_path = Some(val()?),
+            "--oci-image-digest" => oci_image_digest = Some(val()?),
+            "--out" => out = val()?,
+            "--log" => log_path = Some(val()?),
+            other => bail!("unknown provenance flag: {other}"),
+        }
+    }
+
+    let reference_path = reference_path
+        .context("provenance requires --reference snp-reference.json (from snp-measure)")?;
+    let reference: SnpReference = serde_json::from_slice(
+        &std::fs::read(&reference_path).with_context(|| format!("reading {reference_path}"))?,
+    )
+    .with_context(|| format!("parsing {reference_path}"))?;
+
+    let mut subjects: Vec<Subject> = Vec::new();
+
+    // OCI image digest (sha256), if the caller captured it from `docker build`/buildx.
+    if let Some(d) = &oci_image_digest {
+        let hexpart = d.strip_prefix("sha256:").unwrap_or(d);
+        subjects.push(Subject {
+            name: "oci-image".into(),
+            digest: digest_map("sha256", hexpart),
+        });
+    }
+
+    // Guest launch artifacts (OVMF + UKI) come straight from the commit-bound reference, so
+    // the provenance and the measurement pin the exact same bytes.
+    for a in &reference.launch_artifacts {
+        let name = std::path::Path::new(&a.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&a.path)
+            .to_string();
+        subjects.push(Subject {
+            name,
+            digest: digest_map("sha384", &a.sha384_hex),
+        });
+    }
+
+    // Binary digests from the image manifest (secgit-server / secgit-verify).
+    if let Some(path) = &image_manifest_path {
+        let manifest: ImageManifest = serde_json::from_slice(
+            &std::fs::read(path).with_context(|| format!("reading {path}"))?,
+        )
+        .with_context(|| format!("parsing {path}"))?;
+        for a in &manifest.artifacts {
+            let name = std::path::Path::new(&a.path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&a.path)
+                .to_string();
+            subjects.push(Subject {
+                name,
+                digest: digest_map("sha384", &a.sha384_hex),
+            });
+        }
+    }
+
+    // SBOM digest (recomputed from the file), so the published bill of materials is bound too.
+    if let Some(path) = &sbom_path {
+        let (sha, _len) = sha384_file(path)?;
+        subjects.push(Subject {
+            name: "sbom.json".into(),
+            digest: digest_map("sha384", &sha),
+        });
+    }
+
+    if subjects.is_empty() {
+        bail!("no subjects to attest — the reference has no launch_artifacts and no --image-manifest/--sbom/--oci-image-digest was given");
+    }
+
+    let predicate = ProvenancePredicate {
+        build_type: "https://secgit.dev/reproducible-oci-cvm/v1".into(),
+        builder_id: "secgit-xtask".into(),
+        snp_measurement_hex: reference.measurement_hex.to_lowercase(),
+        vmm_launch_method: reference
+            .vmm_launch_method
+            .clone()
+            .unwrap_or_else(|| "sev-snp-measure-direct-boot".into()),
+        git_commit: reference
+            .git_commit
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        source_date_epoch: std::env::var("SOURCE_DATE_EPOCH").unwrap_or_default(),
+    };
+
+    let statement = ProvenanceStatement {
+        type_: "https://in-toto.io/Statement/v1".into(),
+        predicate_type: "https://slsa.dev/provenance/v1".into(),
+        subject: subjects,
+        predicate,
+    };
+
+    // Canonical signed bytes = compact serialization (stable field order); the human-readable
+    // file is pretty-printed but the signature is over the compact form.
+    let canonical = serde_json::to_vec(&statement).context("serializing provenance statement")?;
+
+    // Sign with the long-lived hybrid PQC parameter set. Production releases pin a persistent
+    // key via SECGIT_PROVENANCE_KEY (a SigningKeyBundle JSON); otherwise an ephemeral key is
+    // generated and its verifying key published alongside the statement.
+    let signer = match std::env::var("SECGIT_PROVENANCE_KEY") {
+        Ok(p) => {
+            let bundle: secgit_crypto::sig::SigningKeyBundle =
+                serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("reading {p}"))?)
+                    .with_context(|| format!("parsing signing bundle {p}"))?;
+            secgit_crypto::sig::SigningKey::from_bundle(&bundle)?
+        }
+        Err(_) => {
+            eprintln!(
+                "[NOTE] SECGIT_PROVENANCE_KEY unset: using an EPHEMERAL provenance key. For a \
+                 release, run `xtask provenance-keygen` once (offline), then set \
+                 SECGIT_PROVENANCE_KEY=<bundle> so the signature matches the published \
+                 deploy/provenance.vk.json."
+            );
+            secgit_crypto::sig::SigningKey::generate(secgit_crypto::LONG_LIVED_SIG)?
+        }
+    };
+    let sig = signer.sign(&canonical)?;
+
+    std::fs::write(&out, serde_json::to_vec_pretty(&statement)?)
+        .with_context(|| format!("writing {out}"))?;
+    let sig_path = format!("{out}.sig");
+    std::fs::write(&sig_path, hex::encode(&sig))?;
+    let vk_path = format!("{out}.vk.json");
+    std::fs::write(
+        &vk_path,
+        serde_json::to_vec_pretty(&signer.verifying_key())?,
+    )?;
+
+    println!(
+        "wrote {out} ({} subject(s)), {sig_path} (hybrid PQC signature), {vk_path}",
+        statement.subject.len()
+    );
+    println!(
+        "  measurement={} commit={}",
+        statement.predicate.snp_measurement_hex, statement.predicate.git_commit
+    );
+    println!("verify with: secgit-verify verify-provenance {out} {sig_path} {vk_path}");
+
+    // Anchor the provenance in our own PQC-signed transparency log (auditable, no external
+    // service). The entry binds commit -> measurement, same as snp-measure's reference entry.
+    if let Some(log) = log_path {
+        append_transparency(
+            &log,
+            "secgit-provenance",
+            format!(
+                "provenance measurement={} commit={} subjects={}",
+                statement.predicate.snp_measurement_hex,
+                statement.predicate.git_commit,
+                statement.subject.len()
+            ),
+            "ci-reproducible-build",
+        )?;
+    }
+    Ok(())
+}
+
+/// Offline provenance signing-key ceremony.
+///
+/// Generates the long-lived hybrid PQC signing key ONCE and splits it: the PRIVATE bundle
+/// (`--bundle-out`, default `provenance-signing-key.json`) is what a release feeds back in via
+/// `SECGIT_PROVENANCE_KEY` and MUST be moved offline / into an HSM and never committed; the
+/// PUBLIC verifying key (`--vk-out`, default `deploy/provenance.vk.json`) is committed and
+/// published so any verifier can check a release's `provenance.json` without trusting us.
+fn provenance_keygen(args: &[String]) -> Result<()> {
+    let mut bundle_out = "provenance-signing-key.json".to_string();
+    let mut vk_out = "deploy/provenance.vk.json".to_string();
+    let mut force = false;
+
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let mut val = || -> Result<String> {
+            it.next()
+                .cloned()
+                .with_context(|| format!("flag {flag} needs a value"))
+        };
+        match flag.as_str() {
+            "--bundle-out" => bundle_out = val()?,
+            "--vk-out" => vk_out = val()?,
+            "--force" => force = true,
+            other => bail!("unknown provenance-keygen flag: {other}"),
+        }
+    }
+
+    if std::path::Path::new(&bundle_out).exists() && !force {
+        bail!("{bundle_out} exists; refusing to overwrite an existing signing key (pass --force)");
+    }
+
+    let (signer, bundle) =
+        secgit_crypto::sig::SigningKey::generate_with_bundle(secgit_crypto::LONG_LIVED_SIG)?;
+
+    // Private material: write with restrictive permissions on Unix.
+    std::fs::write(&bundle_out, serde_json::to_vec_pretty(&bundle)?)
+        .with_context(|| format!("writing {bundle_out}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&bundle_out, std::fs::Permissions::from_mode(0o600));
+    }
+
+    if let Some(parent) = std::path::Path::new(&vk_out).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&vk_out, serde_json::to_vec_pretty(&signer.verifying_key())?)
+        .with_context(|| format!("writing {vk_out}"))?;
+
+    println!("wrote PRIVATE signing bundle -> {bundle_out}");
+    println!("  MOVE THIS OFFLINE (HSM / air-gapped vault). NEVER commit it. Anyone with it can");
+    println!("  forge SecGit release provenance.");
+    println!(
+        "wrote PUBLIC verifying key   -> {vk_out}  (commit + publish; verifiers default to it)"
+    );
+    println!(
+        "release signing: export SECGIT_PROVENANCE_KEY={bundle_out} before `xtask provenance`"
+    );
+    Ok(())
 }
 
 /// Parse the `name = "..."` entries from a Cargo.lock.
@@ -286,6 +611,89 @@ fn validate_measurement_hex(m: &str) -> Result<()> {
     Ok(())
 }
 
+/// The source revision this reference is built from. Best-effort: `None` outside a git
+/// checkout (e.g. an unpacked source tarball), which is recorded honestly rather than faked.
+fn git_commit() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// A digest field still carrying its scaffold placeholder (not yet pinned to real bytes).
+fn is_placeholder_digest(h: &str) -> bool {
+    h.is_empty() || h.to_ascii_uppercase().starts_with("REPLACE")
+}
+
+/// Recompute the SHA-384 of every declared launch input and bind it:
+///   - if the descriptor pins a real digest, the file MUST match it (fail-closed);
+///   - if an `image-manifest.json` is supplied, any overlapping path MUST agree with it;
+///   - missing files (guest image not built yet) and unpinned placeholders are skipped with
+///     a loud NOTE so a partial/scaffold reference is never mistaken for a bound one.
+///
+/// Returns the digests actually computed (present files), for embedding in the reference.
+fn verify_and_collect_artifacts(
+    params: &SnpMeasureParams,
+    manifest: Option<&ImageManifest>,
+) -> Result<Vec<ArtifactDigest>> {
+    let mut collected = vec![];
+    for ea in &params.expected_artifacts {
+        if !std::path::Path::new(&ea.path).exists() {
+            eprintln!(
+                "[NOTE] launch artifact '{}' ({}) not present on disk — skipping digest bind \
+                 (expected until the guest image is assembled in M7).",
+                ea.role, ea.path
+            );
+            continue;
+        }
+        let (sha, len) = sha384_file(&ea.path)?;
+        if is_placeholder_digest(&ea.sha384_hex) {
+            eprintln!(
+                "[NOTE] launch artifact '{}' has an UNPINNED digest in the descriptor; \
+                 recording computed sha384={sha}. Pin it to make the reference tamper-evident.",
+                ea.role
+            );
+        } else if !ea.sha384_hex.eq_ignore_ascii_case(&sha) {
+            bail!(
+                "launch artifact '{}' ({}) sha384 MISMATCH: descriptor pins {}, file is {}",
+                ea.role,
+                ea.path,
+                ea.sha384_hex,
+                sha
+            );
+        }
+        if let Some(m) = manifest {
+            if let Some(mm) = m.artifacts.iter().find(|a| a.path == ea.path) {
+                if !mm.sha384_hex.eq_ignore_ascii_case(&sha) {
+                    bail!(
+                        "launch artifact '{}' ({}) sha384 {} disagrees with image-manifest.json ({})",
+                        ea.role,
+                        ea.path,
+                        sha,
+                        mm.sha384_hex
+                    );
+                }
+            }
+        }
+        println!("[bind] {} {} sha384={}", ea.role, ea.path, sha);
+        collected.push(ArtifactDigest {
+            path: ea.path.clone(),
+            sha384_hex: sha,
+            len,
+        });
+    }
+    Ok(collected)
+}
+
 /// Append one event to a PQC-signed transparency log and print/record the checkpoint.
 fn append_transparency(log_path: &str, log_id: &str, action: String, actor: &str) -> Result<()> {
     let signer =
@@ -314,6 +722,7 @@ fn snp_measure(args: &[String]) -> Result<()> {
     let mut p = SnpMeasureParams::default();
     let mut measurement_override: Option<String> = None;
     let mut log_path: Option<String> = None;
+    let mut image_manifest_path: Option<String> = None;
     let mut out = "snp-reference.json".to_string();
 
     let mut it = args.iter();
@@ -342,10 +751,25 @@ fn snp_measure(args: &[String]) -> Result<()> {
             "--vcpu-type" => p.vcpu_type = Some(val()?),
             "--measurement" => measurement_override = Some(val()?),
             "--log" => log_path = Some(val()?),
+            "--image-manifest" => image_manifest_path = Some(val()?),
             "--out" => out = val()?,
             other => bail!("unknown snp-measure flag: {other}"),
         }
     }
+
+    // Bind the reference to the launch inputs: recompute each declared artifact's digest and
+    // refuse on any mismatch with the descriptor or the image manifest. This is what makes
+    // the measurement "the ACTUAL guest," not an abstract input file.
+    let manifest = match &image_manifest_path {
+        Some(path) => Some(
+            serde_json::from_slice::<ImageManifest>(
+                &std::fs::read(path).with_context(|| format!("reading {path}"))?,
+            )
+            .with_context(|| format!("parsing image manifest {path}"))?,
+        ),
+        None => None,
+    };
+    let launch_artifacts = verify_and_collect_artifacts(&p, manifest.as_ref())?;
 
     let (measurement_hex, tool) = match measurement_override {
         Some(m) => (m, "recorded (on-silicon / external)".to_string()),
@@ -353,23 +777,37 @@ fn snp_measure(args: &[String]) -> Result<()> {
     };
     validate_measurement_hex(&measurement_hex)?;
 
+    let commit = git_commit();
+    let launch_method = p.vmm_launch_method.clone();
     let reference = SnpReference {
         measurement_hex: measurement_hex.clone(),
         mode: "snp".into(),
         params: p,
         tool,
         note: "Pin into Policy.allowed_measurements; published to the transparency log so \
-               a third party can confirm the operator did not silently change it."
+               a third party can rebuild from git_commit and confirm the operator did not \
+               silently change it."
             .into(),
+        git_commit: commit.clone(),
+        vmm_launch_method: launch_method,
+        launch_artifacts,
     };
     std::fs::write(&out, serde_json::to_vec_pretty(&reference)?)?;
-    println!("wrote {out} (measurement={measurement_hex})");
+    println!(
+        "wrote {out} (measurement={measurement_hex}, commit={})",
+        commit.as_deref().unwrap_or("unknown")
+    );
 
     if let Some(log) = log_path {
+        // The transparency entry binds commit -> measurement so the chain
+        // (git commit -> reproducible image -> predicted measurement) is auditable.
         append_transparency(
             &log,
             "secgit-snp-reference",
-            format!("snp-measurement sha384={measurement_hex}"),
+            format!(
+                "snp-measurement sha384={measurement_hex} commit={}",
+                commit.as_deref().unwrap_or("unknown")
+            ),
             "ci-reproducible-build",
         )?;
     }
@@ -531,6 +969,7 @@ mod tests {
             append: Some("console=ttyS0".into()),
             vcpus: Some(4),
             vcpu_type: Some("EpycV4".into()),
+            ..Default::default()
         };
         let a = build_sev_snp_measure_args(&p).unwrap();
         assert!(a.windows(2).any(|w| w[0] == "--mode" && w[1] == "snp"));
@@ -561,7 +1000,7 @@ mod tests {
             "ovmf": "OVMF.fd",
             "kernel": "vmlinuz",
             "initrd": "initrd.img",
-            "append": "console=ttyS0 root=/dev/vda1 ro",
+            "append": "console=ttyS0 systemd.verity=yes ro",
             "vcpus": 4,
             "vcpu_type": "EPYC-v4"
         });
@@ -587,11 +1026,225 @@ mod tests {
             },
             tool: "sev-snp-measure".into(),
             note: "n".into(),
+            git_commit: Some("deadbeef".into()),
+            vmm_launch_method: Some("sev-snp-measure-direct-boot".into()),
+            launch_artifacts: vec![ArtifactDigest {
+                path: "OVMF.fd".into(),
+                sha384_hex: "ab".repeat(48),
+                len: 42,
+            }],
         };
         let j = serde_json::to_vec(&r).unwrap();
         let back: SnpReference = serde_json::from_slice(&j).unwrap();
         assert_eq!(back.measurement_hex, r.measurement_hex);
         assert_eq!(back.params.ovmf, "OVMF.fd");
+        assert_eq!(back.git_commit.as_deref(), Some("deadbeef"));
+        assert_eq!(back.launch_artifacts.len(), 1);
+    }
+
+    #[test]
+    fn launch_descriptor_parses_pinned_fields() {
+        // The `deploy/snp-inputs.example.json` shape: launch method + pinned artifacts.
+        let json = serde_json::json!({
+            "vmm_launch_method": "sev-snp-measure-direct-boot",
+            "ovmf": "deploy/guest/out/OVMF.fd",
+            "kernel": "deploy/guest/out/secgit-guest.efi",
+            "append": "console=ttyS0 systemd.verity=yes ro",
+            "vcpus": 4,
+            "vcpu_type": "EPYC-v4",
+            "ovmf_pin": "deploy/guest/ovmf.pin.json",
+            "expected_artifacts": [
+                { "role": "ovmf", "path": "deploy/guest/out/OVMF.fd", "sha384_hex": "REPLACE_ME" },
+                { "role": "uki", "path": "deploy/guest/out/secgit-guest.efi", "sha384_hex": "REPLACE_ME" }
+            ]
+        });
+        let p: SnpMeasureParams = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            p.vmm_launch_method.as_deref(),
+            Some("sev-snp-measure-direct-boot")
+        );
+        assert_eq!(p.expected_artifacts.len(), 2);
+        assert_eq!(p.expected_artifacts[0].role, "ovmf");
+        // The measure arg builder ignores the binding fields but still works.
+        let a = build_sev_snp_measure_args(&p).unwrap();
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--ovmf" && w[1] == "deploy/guest/out/OVMF.fd"));
+    }
+
+    #[test]
+    fn artifact_bind_matches_and_detects_tamper() {
+        let dir = std::env::temp_dir().join(format!("secgit-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("OVMF.fd");
+        std::fs::write(&f, b"pretend-firmware-bytes").unwrap();
+        let (real, _len) = sha384_file(f.to_str().unwrap()).unwrap();
+
+        // Correctly-pinned digest binds and is collected.
+        let ok = SnpMeasureParams {
+            ovmf: f.to_string_lossy().into(),
+            expected_artifacts: vec![ExpectedArtifact {
+                role: "ovmf".into(),
+                path: f.to_string_lossy().into(),
+                sha384_hex: real.clone(),
+            }],
+            ..Default::default()
+        };
+        let collected = verify_and_collect_artifacts(&ok, None).unwrap();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].sha384_hex, real);
+
+        // A wrong pinned digest must fail closed.
+        let bad = SnpMeasureParams {
+            expected_artifacts: vec![ExpectedArtifact {
+                role: "ovmf".into(),
+                path: f.to_string_lossy().into(),
+                sha384_hex: "00".repeat(48),
+            }],
+            ..Default::default()
+        };
+        assert!(verify_and_collect_artifacts(&bad, None).is_err());
+
+        // A placeholder digest is tolerated (unpinned scaffold) and still records the file.
+        let ph = SnpMeasureParams {
+            expected_artifacts: vec![ExpectedArtifact {
+                role: "ovmf".into(),
+                path: f.to_string_lossy().into(),
+                sha384_hex: "REPLACE_WITH_SHA384".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(verify_and_collect_artifacts(&ph, None).unwrap().len(), 1);
+
+        // A missing file is skipped (not an error) — the guest image isn't built yet.
+        let missing = SnpMeasureParams {
+            expected_artifacts: vec![ExpectedArtifact {
+                role: "uki".into(),
+                path: dir.join("does-not-exist").to_string_lossy().into(),
+                sha384_hex: "REPLACE".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(verify_and_collect_artifacts(&missing, None)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artifact_bind_cross_checks_image_manifest() {
+        let dir = std::env::temp_dir().join(format!("secgit-bindmf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("secgit-server");
+        std::fs::write(&f, b"binary-bytes").unwrap();
+        let (real, len) = sha384_file(f.to_str().unwrap()).unwrap();
+        let path = f.to_string_lossy().to_string();
+
+        let params = SnpMeasureParams {
+            expected_artifacts: vec![ExpectedArtifact {
+                role: "server".into(),
+                path: path.clone(),
+                sha384_hex: real.clone(),
+            }],
+            ..Default::default()
+        };
+
+        // Manifest agrees -> ok.
+        let agree = ImageManifest {
+            artifacts: vec![ArtifactDigest {
+                path: path.clone(),
+                sha384_hex: real.clone(),
+                len,
+            }],
+            source_date_epoch: None,
+            note: String::new(),
+        };
+        assert!(verify_and_collect_artifacts(&params, Some(&agree)).is_ok());
+
+        // Manifest disagrees on the same path -> fail closed.
+        let disagree = ImageManifest {
+            artifacts: vec![ArtifactDigest {
+                path: path.clone(),
+                sha384_hex: "11".repeat(48),
+                len,
+            }],
+            source_date_epoch: None,
+            note: String::new(),
+        };
+        assert!(verify_and_collect_artifacts(&params, Some(&disagree)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provenance_statement_signs_and_verifies_over_canonical_bytes() {
+        // The signed bytes are the COMPACT serialization; a verifier that parses the pretty
+        // file and re-serializes compactly must reproduce the exact bytes (stable field order).
+        let statement = ProvenanceStatement {
+            type_: "https://in-toto.io/Statement/v1".into(),
+            predicate_type: "https://slsa.dev/provenance/v1".into(),
+            subject: vec![Subject {
+                name: "OVMF.fd".into(),
+                digest: digest_map("sha384", &"ab".repeat(48)),
+            }],
+            predicate: ProvenancePredicate {
+                build_type: "https://secgit.dev/reproducible-oci-cvm/v1".into(),
+                builder_id: "secgit-xtask".into(),
+                snp_measurement_hex: "cd".repeat(48),
+                vmm_launch_method: "sev-snp-measure-direct-boot".into(),
+                git_commit: "deadbeef".into(),
+                source_date_epoch: "1700000000".into(),
+            },
+        };
+        let canonical = serde_json::to_vec(&statement).unwrap();
+        let sk = secgit_crypto::sig::SigningKey::generate(secgit_crypto::LONG_LIVED_SIG).unwrap();
+        let vk = sk.verifying_key();
+        let sig = sk.sign(&canonical).unwrap();
+
+        // Round-trip through the on-disk (pretty) form, then re-serialize compact.
+        let pretty = serde_json::to_vec_pretty(&statement).unwrap();
+        let parsed: ProvenanceStatement = serde_json::from_slice(&pretty).unwrap();
+        let recanon = serde_json::to_vec(&parsed).unwrap();
+        assert_eq!(canonical, recanon, "canonicalization must be stable");
+        assert!(secgit_crypto::sig::verify(&vk, &recanon, &sig).is_ok());
+        // Tamper detection: flipping a digest breaks the signature.
+        let mut tampered = parsed;
+        tampered.subject[0].digest = digest_map("sha384", &"ff".repeat(48));
+        let tcanon = serde_json::to_vec(&tampered).unwrap();
+        assert!(secgit_crypto::sig::verify(&vk, &tcanon, &sig).is_err());
+    }
+
+    #[test]
+    fn guest_egress_allowlist_is_default_drop() {
+        // Packaging-layer leak-test companion to `egress-check`: prove the in-guest nftables
+        // policy stays default-drop and only permits the KDS/KBS (443) + DNS + service ingress.
+        // A regression that flips a chain to `policy accept` or opens a wildcard egress port
+        // would silently break the no-plaintext-egress invariant; catch it here.
+        let path = format!(
+            "{}/../deploy/guest/nftables.conf",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let conf = std::fs::read_to_string(&path).expect("read nftables.conf");
+        assert!(
+            !conf.contains("policy accept"),
+            "no chain may default to accept (found `policy accept`)"
+        );
+        // All three base chains must default-drop.
+        assert_eq!(
+            conf.matches("policy drop;").count(),
+            3,
+            "input/forward/output must all be `policy drop`"
+        );
+        // The only permitted outbound application port is 443 (KDS/KBS); DNS is 53.
+        assert!(
+            conf.contains("tcp dport 443 accept"),
+            "KDS/KBS egress must be allowed"
+        );
+        assert!(
+            !conf.contains("tcp dport 80 accept"),
+            "plaintext HTTP egress must never be allowed"
+        );
     }
 
     #[test]

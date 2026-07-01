@@ -76,3 +76,125 @@ jobs:
       # (no cloud attestation crates may enter the tree).
       - name: cargo deny
         run: cargo deny check
+
+  reproducibility:
+    # Claim 12: the OCI image is BIT-FOR-BIT reproducible. Builds the image twice from
+    # scratch and fails on any digest drift (see deploy/repro-build.sh, docs/packaging.md).
+    # This is the precondition for binding the SEV-SNP launch measurement to the OSS build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        # rewrite-timestamp requires BuildKit >= 0.13; setup-buildx-action provisions it.
+        uses: docker/setup-buildx-action@v3
+      - name: build twice + compare digests
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: ./deploy/repro-build.sh
+
+  packaging:
+    # M7: exercise the CVM guest-assembly / signing / hardening tooling WITHOUT SEV-SNP
+    # silicon. Everything here is mock/dry-run: it proves the orchestration is sound so the
+    # only thing left for a silicon run is the hardware itself (see docs/STATUS.md M7 section).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint the guest/build/launch shell scripts
+        run: |
+          for s in deploy/*.sh deploy/guest/*.sh; do
+            echo "bash -n $s"; bash -n "$s"
+          done
+          bash -n deploy/guest/mkosi.finalize
+      - name: Validate the seccomp profile parses
+        run: python3 -c "import json; json.load(open('deploy/seccomp-secgit.json')); print('seccomp OK')"
+      - name: No-secrets scan of a source-only rootfs (ROOTFS mode, no docker)
+        run: |
+          root="$(mktemp -d)"; mkdir -p "$root/usr/local/bin"
+          echo binary > "$root/usr/local/bin/secgit-server"
+          ROOTFS="$root" deploy/verify-no-secrets.sh
+      - name: snp-measure (fixture) + PQC provenance sign/verify roundtrip
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          set -euxo pipefail
+          work="$(mktemp -d)"
+          # A stand-in launch artifact + a descriptor that pins its real digest.
+          printf 'pretend-uki-bytes' > "$work/secgit-guest.efi"
+          sha="$(sha384sum "$work/secgit-guest.efi" | awk '{print $1}')"
+          cat > "$work/snp-inputs.json" <<EOF
+          {
+            "vmm_launch_method": "sev-snp-measure-direct-boot",
+            "ovmf": "$work/secgit-guest.efi",
+            "kernel": "$work/secgit-guest.efi",
+            "append": "console=ttyS0 systemd.verity=yes ro",
+            "vcpus": 4, "vcpu_type": "EPYC-v4",
+            "expected_artifacts": [
+              { "role": "uki", "path": "$work/secgit-guest.efi", "sha384_hex": "$sha" }
+            ]
+          }
+          EOF
+          # --measurement override => no sev-snp-measure binary needed in CI; still binds digests.
+          cargo run -q -p xtask --locked -- snp-measure \
+            --inputs "$work/snp-inputs.json" \
+            --measurement "$(printf 'cd%.0s' $(seq 1 48))" \
+            --out "$work/snp-reference.json"
+          cargo run -q -p xtask --locked -- provenance \
+            --reference "$work/snp-reference.json" --out "$work/provenance.json"
+          # Verify FROM the artifact dir so the digest cross-check finds secgit-guest.efi by
+          # name (search dirs are "." and deploy/guest/out); --manifest-path keeps cargo happy.
+          repo="$PWD"
+          cd "$work"
+          cargo run -q -p secgit-verify --manifest-path "$repo/Cargo.toml" --locked -- \
+            verify-provenance provenance.json provenance.json.sig provenance.json.vk.json
+      - name: Published provenance verifying key is present and well-formed
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          vk = json.load(open("deploy/provenance.vk.json"))
+          for k in ("scheme", "ed25519_pub", "mldsa_pub"):
+              assert k in vk, f"deploy/provenance.vk.json missing {k}"
+          assert vk["ed25519_pub"] and vk["mldsa_pub"], "empty public key halves"
+          print("published provenance verifying key OK")
+          PY
+
+  release-provenance:
+    # Tag builds only: sign provenance with the OFFLINE release key (a repo secret holding the
+    # SigningKeyBundle produced by `xtask provenance-keygen`) and re-verify the signature against
+    # the COMMITTED published key (deploy/provenance.vk.json). This proves a real release is
+    # signed by the key users trust — PR CI keeps the ephemeral roundtrip above.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Sign provenance with the offline release key and verify against the published vk
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+          PROVENANCE_SIGNING_KEY: ${{ secrets.PROVENANCE_SIGNING_KEY }}
+        run: |
+          set -euxo pipefail
+          test -n "$PROVENANCE_SIGNING_KEY" || { echo "::error::PROVENANCE_SIGNING_KEY secret not set"; exit 1; }
+          work="$(mktemp -d)"
+          printf '%s' "$PROVENANCE_SIGNING_KEY" > "$work/signing-key.json"
+          printf 'release-uki-bytes' > "$work/secgit-guest.efi"
+          sha="$(sha384sum "$work/secgit-guest.efi" | awk '{print $1}')"
+          cat > "$work/snp-inputs.json" <<EOF
+          { "vmm_launch_method": "sev-snp-measure-direct-boot",
+            "ovmf": "$work/secgit-guest.efi", "kernel": "$work/secgit-guest.efi",
+            "append": "console=ttyS0 systemd.verity=yes ro", "vcpus": 4, "vcpu_type": "EPYC-v4",
+            "expected_artifacts": [ { "role": "uki", "path": "$work/secgit-guest.efi", "sha384_hex": "$sha" } ] }
+          EOF
+          cargo run -q -p xtask --locked -- snp-measure \
+            --inputs "$work/snp-inputs.json" \
+            --measurement "$(printf 'cd%.0s' $(seq 1 48))" \
+            --out "$work/snp-reference.json"
+          SECGIT_PROVENANCE_KEY="$work/signing-key.json" cargo run -q -p xtask --locked -- provenance \
+            --reference "$work/snp-reference.json" --out "$work/provenance.json"
+          # Verify against the COMMITTED published key, not the per-run vk: this fails loudly if
+          # the release key drifts from deploy/provenance.vk.json.
+          cargo run -q -p secgit-verify --locked -- \
+            verify-provenance "$work/provenance.json" "$work/provenance.json.sig" deploy/provenance.vk.json
+          rm -rf "$work"

@@ -8,3 +8,8 @@ description = "Git smart-HTTP wire handlers (shell out to git-upload-pack/receiv
 
 [dependencies]
 thiserror.workspace = true
+
+# Kill the whole git process group (child + grandchildren like `pack-objects`) on a
+# timeout/output-cap. Unix-only; other targets fall back to a direct child kill.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

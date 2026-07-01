@@ -10,19 +10,27 @@
 //! for the demo-as-sandbox model and `docs/adr/0009-milestones.md` for what is
 //! deferred (confidential CI is v2).
 
+mod abuse;
 mod api;
 mod authz;
+mod config;
 mod events;
 mod http;
 mod importer;
 mod kbs;
+mod metrics;
+mod pow;
+mod ratelimit;
 mod ssh;
 mod sso;
 mod tls;
 mod web;
 
 use anyhow::{Context, Result};
-use http::{Request, Response};
+use config::{MetricsConfig, ServerLimits};
+use http::{ParseOutcome, Request, Response};
+use metrics::Metrics;
+use ratelimit::{RateLimiter, Semaphore};
 use secgit_api::{AccountQuota, DeploymentConfig, EphemeralRepos, Tier};
 use secgit_attest::{detect_attester, Policy, ReportData};
 use secgit_audit::{AuditEvent, TransparencyLog};
@@ -34,6 +42,61 @@ use secgit_keybroker::{attest_and_unwrap, InMemoryKekProvider, LocalKeyBroker};
 use secgit_store::EncryptedStore;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+
+/// Per-key rate limiters guarding the public sandbox. All are memory-bounded token buckets.
+struct Limiters {
+    /// Per-IP request rate across all endpoints.
+    ip_req: RateLimiter,
+    /// Per-IP git smart-HTTP operation rate.
+    ip_git: RateLimiter,
+    /// Per-account operation rate (repo create, authenticated pushes).
+    account: RateLimiter,
+    /// Per-repo push rate — directly bounds `seal_to_store` re-bundle frequency.
+    push: RateLimiter,
+}
+
+impl Limiters {
+    fn from_limits(l: &ServerLimits) -> Self {
+        Self {
+            ip_req: RateLimiter::new(
+                l.ip_req_capacity,
+                l.ip_req_refill,
+                l.rl_max_keys,
+                l.rl_idle_evict,
+            ),
+            ip_git: RateLimiter::new(
+                l.ip_git_capacity,
+                l.ip_git_refill,
+                l.rl_max_keys,
+                l.rl_idle_evict,
+            ),
+            account: RateLimiter::new(
+                l.account_capacity,
+                l.account_refill,
+                l.rl_max_keys,
+                l.rl_idle_evict,
+            ),
+            push: RateLimiter::new(
+                l.push_capacity,
+                l.push_refill,
+                l.rl_max_keys,
+                l.rl_idle_evict,
+            ),
+        }
+    }
+}
+
+/// RAII guard that decrements the active-connection gauge when a connection handler exits.
+struct ConnGuard {
+    metrics: Arc<Metrics>,
+}
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 struct App {
     forge: Forge,
@@ -56,6 +119,22 @@ struct App {
     scim_token: Option<String>,
     /// Public base URL used to render SCIM `meta.location` / SP metadata.
     external_base_url: String,
+    /// Transport + abuse-control limits for the public sandbox.
+    limits: ServerLimits,
+    /// Per-IP / per-account / per-repo rate limiters.
+    rl: Limiters,
+    /// Bounds concurrent (expensive) repo seals.
+    seal_sem: Semaphore,
+    /// Optional proof-of-work gate for anonymous ephemeral creation.
+    pow: pow::PowGate,
+    /// Content-free metrics registry (shared with the metrics listener).
+    metrics: Arc<Metrics>,
+    /// Metrics exposure config (token gate for `/metrics`).
+    metrics_cfg: MetricsConfig,
+    /// Serializes read-modify-write on the encrypted abuse/waitlist queues.
+    queue_lock: Mutex<()>,
+    /// Operator token gating `/admin/*` (takedown, abuse review). `None` disables admin.
+    admin_token: Option<String>,
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -310,32 +389,45 @@ fn run() -> Result<()> {
     // create). The anonymous *ephemeral* "viral sandbox" path creates a second, throwaway,
     // owner-less repo kind that never shows in /ui — so it is OFF unless explicitly enabled.
     // The public sandbox turns it back on with SECGIT_ENABLE_ANONYMOUS=1 (config, not a fork).
-    let config = DeploymentConfig {
-        anonymous_enabled: std::env::var("SECGIT_ENABLE_ANONYMOUS").is_ok(),
-        ..DeploymentConfig::default()
-    };
+    // All tier/limit knobs are environment-overridable (see config.rs).
+    let config = config::deployment_from_env();
     if config.anonymous_enabled {
         eprintln!(
             "secgit-server: anonymous ephemeral repos ENABLED (SECGIT_ENABLE_ANONYMOUS) — \
              these are throwaway and intentionally not shown in /ui"
         );
     }
+
+    // Public-sandbox abuse/DoS controls.
+    let limits = ServerLimits::from_env();
+    let pow_cfg = config::PowConfig::from_env();
+    let metrics_cfg = MetricsConfig::from_env();
+    let admin_token = std::env::var("SECGIT_ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let server_metrics = Arc::new(Metrics::new());
+    if pow_cfg.enabled {
+        println!(
+            "secgit-server: anonymous ephemeral PoW gate ENABLED ({} bits)",
+            pow_cfg.difficulty_bits
+        );
+    }
+
     let (saml, scim_token, external_base_url) = load_sso_config()?;
 
-    // Rebuild persistent-tier quota state from the directory + stored bundle sizes so the
-    // Light-tier caps hold across restarts.
+    // Rebuild persistent-tier quota state from the directory + stored seal sizes so the
+    // Light-tier caps hold across restarts. `sealed_size` sums the incremental seal
+    // segments (or the legacy monolithic bundle) without decrypting anything.
     let mut quota = AccountQuota::new(config.clone());
     for repo in identity.dir.list_repos() {
         if let RepoOwner::User(uid) = &repo.owner {
-            let bytes = store
-                .get(&repo.id, "repo.bundle")
-                .ok()
-                .flatten()
-                .map(|b| b.len() as u64)
-                .unwrap_or(0);
+            let bytes = forge.sealed_size(&repo.id, &store).unwrap_or(0);
             quota.preload(uid, Tier::Light, &repo.id, bytes);
         }
     }
+
+    let rl = Limiters::from_limits(&limits);
+    let seal_sem = Semaphore::new(limits.seal_concurrency);
 
     let app = Arc::new(App {
         forge,
@@ -350,48 +442,221 @@ fn run() -> Result<()> {
         saml,
         scim_token,
         external_base_url,
+        limits,
+        rl,
+        seal_sem,
+        pow: pow::PowGate::new(pow_cfg),
+        metrics: Arc::clone(&server_metrics),
+        metrics_cfg: metrics_cfg.clone(),
+        queue_lock: Mutex::new(()),
+        admin_token,
     });
+
+    // Reclaim storage for anonymous ephemeral repos orphaned by a crash/restart: ephemeral
+    // state is in-memory only, so any `ephemeral/*` working set/store entry on boot is an
+    // orphan (its TTL guard is gone). Persistent repos are protected by a directory check.
+    wipe_orphaned_ephemeral(&app);
+
+    // Background GC: expire ephemeral repos and wipe their working set + encrypted storage.
+    spawn_ephemeral_gc(Arc::clone(&app));
+
+    // Dedicated, content-free metrics listener (localhost by default; never public unless
+    // configured). Separate from the main serving port and optionally token-gated.
+    if let Some(maddr) = metrics_cfg.addr.clone() {
+        let metrics = Arc::clone(&server_metrics);
+        let token = metrics_cfg.token.clone();
+        std::thread::spawn(move || serve_metrics(&maddr, metrics, token));
+    }
 
     let addr = std::env::var("SECGIT_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
     let scheme = if tls.is_some() { "https" } else { "http" };
     println!(
-        "secgit-server: listening on {scheme}://{addr} (sandbox_mode={}, pq_tls={})",
+        "secgit-server: listening on {scheme}://{addr} (sandbox_mode={}, pq_tls={}, max_conns={})",
         app.config.sandbox_mode,
-        tls.is_some() && tls::post_quantum_preferred()
+        tls.is_some() && tls::post_quantum_preferred(),
+        app.limits.max_connections,
     );
 
     let tls_config = tls.map(|t| t.config);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // Connection cap: bound concurrent handlers so a flood cannot spawn unbounded
+        // threads / memory. Increment-then-check keeps the gauge honest under races.
+        let prev = app
+            .metrics
+            .active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev as usize >= app.limits.max_connections {
+            app.metrics
+                .active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Metrics::inc(&app.metrics.conn_rejected_total);
+            drop(stream); // close immediately; cheaper than serving 503 under flood
+            continue;
+        }
+        Metrics::inc(&app.metrics.conn_accepted_total);
         let app = Arc::clone(&app);
         let tls_config = tls_config.clone();
-        std::thread::spawn(move || handle_conn(&app, stream, tls_config));
+        std::thread::spawn(move || {
+            let _guard = ConnGuard {
+                metrics: Arc::clone(&app.metrics),
+            };
+            handle_conn(&app, stream, tls_config);
+        });
     }
     Ok(())
 }
 
+/// Serve only the content-free metrics + health on a dedicated (plaintext, localhost by
+/// default) listener. Content-free by construction, so plaintext is acceptable; still
+/// optionally token-gated. Never serves repo content or any other route.
+fn serve_metrics(addr: &str, metrics: Arc<Metrics>, token: Option<String>) {
+    let listener = match TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("secgit-server: metrics listener disabled (bind {addr}: {e})");
+            return;
+        }
+    };
+    println!("secgit-server: content-free metrics on http://{addr}/metrics");
+    let limits = http::HttpLimits::default();
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+        let resp = match http::parse_request(&mut stream, &limits) {
+            Ok(ParseOutcome::Request(req)) => match req.path.as_str() {
+                "/metrics" => {
+                    if metrics_authorized(&token, &req) {
+                        Response::new(
+                            200,
+                            "OK",
+                            "text/plain; version=0.0.4",
+                            metrics.render().into_bytes(),
+                        )
+                    } else {
+                        Response::text(401, "Unauthorized", "metrics token required")
+                    }
+                }
+                "/healthz" => Response::text(200, "OK", "ok"),
+                _ => Response::text(404, "Not Found", "not found"),
+            },
+            Ok(ParseOutcome::Reject(resp)) => resp,
+            _ => continue,
+        };
+        let _ = http::write_response(&mut stream, &resp);
+    }
+}
+
+fn metrics_authorized(token: &Option<String>, req: &Request) -> bool {
+    match token {
+        None => true,
+        Some(t) => req
+            .bearer_token()
+            .map(|got| secgit_crypto::primitives::ct_eq(got.as_bytes(), t.as_bytes()))
+            .unwrap_or(false),
+    }
+}
+
+/// Delete every anonymous ephemeral repo left on disk (working set + encrypted store),
+/// skipping any id that is a real persistent repo in the identity directory.
+fn wipe_orphaned_ephemeral(app: &App) {
+    let mut wiped = 0u64;
+    for stem in app.forge.working_dir_stems() {
+        // Anonymous ephemeral ids are `ephemeral/<hex>` -> sanitized stem `ephemeral_<hex>`.
+        let Some(hex) = stem.strip_prefix("ephemeral_") else {
+            continue;
+        };
+        let repo_id = format!("ephemeral/{hex}");
+        let is_persistent = app
+            .identity
+            .lock()
+            .unwrap()
+            .dir
+            .get_repo(&repo_id)
+            .is_some();
+        if is_persistent {
+            continue;
+        }
+        let _ = app.forge.delete(&repo_id);
+        let _ = app.store.delete_repo(&repo_id);
+        wiped += 1;
+    }
+    if wiped > 0 {
+        println!("secgit-server: reclaimed {wiped} orphaned ephemeral repo(s) at startup");
+    }
+}
+
+/// Spawn the background GC loop that expires ephemeral repos and wipes their storage.
+fn spawn_ephemeral_gc(app: Arc<App>) {
+    // Sweep at a fraction of the TTL so expired repos are reclaimed promptly, clamped to a
+    // sane range so a tiny TTL doesn't busy-loop.
+    let ttl = app.config.ephemeral_ttl_secs.max(1);
+    let interval = (ttl / 4).clamp(30, 3600);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+        let expired = app.ephemeral.lock().unwrap().gc();
+        for repo_id in expired {
+            let _ = app.forge.delete(&repo_id);
+            let _ = app.store.delete_repo(&repo_id);
+            Metrics::inc(&app.metrics.ephemeral_gc_total);
+        }
+    });
+}
+
 /// Serve one connection, terminating TLS in-process when configured.
+///
+/// Socket read/write timeouts are set before the (TLS) handshake so a slowloris cannot pin
+/// the connection during the handshake or while trickling headers/body.
 fn handle_conn(app: &App, stream: TcpStream, tls: Option<Arc<rustls::ServerConfig>>) {
+    let _ = stream.set_read_timeout(Some(app.limits.read_timeout));
+    let _ = stream.set_write_timeout(Some(app.limits.write_timeout));
+    let peer_ip = stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
     match tls {
         Some(cfg) => {
             let Ok(conn) = rustls::ServerConnection::new(cfg) else {
                 return;
             };
             let mut tls_stream = rustls::StreamOwned::new(conn, stream);
-            if let Ok(Some(req)) = http::parse_request(&mut tls_stream) {
-                let resp = route(app, &req);
-                let _ = http::write_response(&mut tls_stream, &resp);
-            }
+            serve_stream(app, &mut tls_stream, &peer_ip);
         }
         None => {
             let mut stream = stream;
-            if let Ok(Some(req)) = http::parse_request(&mut stream) {
-                let resp = route(app, &req);
-                let _ = http::write_response(&mut stream, &resp);
-            }
+            serve_stream(app, &mut stream, &peer_ip);
         }
     }
+}
+
+/// Parse one request from `s`, enforce the per-IP request-rate limit, route it, and write
+/// the response — recording content-free metrics along the way.
+fn serve_stream<S: std::io::Read + std::io::Write>(app: &App, s: &mut S, peer_ip: &str) {
+    let resp = match http::parse_request(s, &app.limits.http_limits()) {
+        Ok(ParseOutcome::Request(mut req)) => {
+            req.peer_ip = peer_ip.to_string();
+            if !app.rl.ip_req.check(peer_ip) {
+                Metrics::inc(&app.metrics.rate_limited_total);
+                Response::text(429, "Too Many Requests", "rate limit exceeded")
+                    .with_header("Retry-After", "1")
+            } else {
+                route(app, &req)
+            }
+        }
+        Ok(ParseOutcome::Reject(resp)) => {
+            match resp.status {
+                413 => Metrics::inc(&app.metrics.body_rejected_total),
+                431 => Metrics::inc(&app.metrics.header_rejected_total),
+                _ => {}
+            }
+            resp
+        }
+        _ => return,
+    };
+    app.metrics.record_status(resp.status);
+    let _ = http::write_response(s, &resp);
 }
 
 /// Derive a domain-separated subkey from the instance KEK via HKDF. Each subsystem
@@ -545,12 +810,163 @@ fn route(app: &App, req: &Request) -> Response {
     match (req.method.as_str(), path.as_str()) {
         ("GET", "/") => landing(app),
         ("GET", "/healthz") => Response::text(200, "OK", "ok"),
+        ("GET", "/metrics") => metrics_endpoint(app, req),
         ("GET", "/sbom") => transparency_file("SECGIT_SBOM"),
         ("GET", "/image-manifest") => transparency_file("SECGIT_IMAGE_MANIFEST"),
         ("GET", "/attestation") => attestation(app),
+        ("GET", "/sandbox/pow-challenge") => pow_challenge(app, req),
         ("POST", "/sandbox/ephemeral") => create_ephemeral(app, req),
+        ("POST", "/abuse/report") => abuse_report(app, req),
+        ("POST", "/waitlist") => waitlist_signup(app, req),
+        ("GET", "/admin/abuse") => admin_list_abuse(app, req),
+        ("POST", "/admin/repos/delete") => admin_takedown(app, req),
         _ => git_route(app, req),
     }
+}
+
+/// Content-free metrics on the main serving port. Only exposed when a metrics token is
+/// configured AND presented — so the public port never leaks an open metrics endpoint. The
+/// dedicated localhost listener ([`serve_metrics`]) is the normal scrape path.
+fn metrics_endpoint(app: &App, req: &Request) -> Response {
+    match &app.metrics_cfg.token {
+        Some(_) if metrics_authorized(&app.metrics_cfg.token, req) => Response::new(
+            200,
+            "OK",
+            "text/plain; version=0.0.4",
+            app.metrics.render().into_bytes(),
+        ),
+        _ => Response::text(404, "Not Found", "not found"),
+    }
+}
+
+/// Issue a proof-of-work challenge for the anonymous ephemeral-create path.
+fn pow_challenge(app: &App, req: &Request) -> Response {
+    if !app.pow.enabled() {
+        return Response::json(&serde_json::json!({ "enabled": false }));
+    }
+    Metrics::inc(&app.metrics.pow_challenges_total);
+    let challenge = app.pow.issue(&req.peer_ip);
+    Response::json(&serde_json::json!({
+        "enabled": true,
+        "difficulty_bits": app.pow.difficulty_bits(),
+        "challenge": challenge,
+        "solve": "find NONCE s.t. sha256(\"<challenge>:<NONCE>\") has >= difficulty_bits leading zero bits; \
+                  submit header 'X-SecGit-PoW: <challenge>:<NONCE>' to POST /sandbox/ephemeral",
+    }))
+}
+
+/// Accept an abuse report for a repo id. Stored encrypted; operator stays content-blind.
+/// Aggressively rate-limited (per-IP) since it is an unauthenticated public endpoint.
+fn abuse_report(app: &App, req: &Request) -> Response {
+    if !app.rl.ip_git.check(&req.peer_ip) {
+        Metrics::inc(&app.metrics.rate_limited_total);
+        return Response::text(429, "Too Many Requests", "rate limit exceeded");
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+    let repo_id = body.get("repo_id").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    if repo_id.is_empty() {
+        return Response::text(400, "Bad Request", "repo_id is required");
+    }
+    match abuse::report(&app.store, &app.queue_lock, repo_id, reason, &req.peer_ip) {
+        Ok(rep) => {
+            Metrics::inc(&app.metrics.abuse_reports_total);
+            if let Ok(mut log) = app.audit.lock() {
+                let _ = log.append(AuditEvent::Admin {
+                    action: format!("abuse_report:{repo_id}"),
+                    actor: "anonymous".into(),
+                });
+            }
+            Response::new(202, "Accepted", "application/json", {
+                serde_json::json!({ "accepted": true, "report_id": rep.id })
+                    .to_string()
+                    .into_bytes()
+            })
+        }
+        Err(e) => Response::text(500, "Internal Server Error", &e),
+    }
+}
+
+/// Capture a managed-tier waitlist signup (email) into the encrypted queue.
+fn waitlist_signup(app: &App, req: &Request) -> Response {
+    if !app.rl.ip_git.check(&req.peer_ip) {
+        Metrics::inc(&app.metrics.rate_limited_total);
+        return Response::text(429, "Too Many Requests", "rate limit exceeded");
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+    let email = body
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if email.is_empty() || !email.contains('@') || email.len() > 320 {
+        return Response::text(400, "Bad Request", "a valid email is required");
+    }
+    match abuse::waitlist_add(&app.store, &app.queue_lock, email) {
+        Ok(()) => Response::new(
+            202,
+            "Accepted",
+            "application/json",
+            serde_json::json!({ "waitlisted": true })
+                .to_string()
+                .into_bytes(),
+        ),
+        Err(e) => Response::text(500, "Internal Server Error", &e),
+    }
+}
+
+/// Operator-only: verify the admin token (constant-time). `None` config disables `/admin/*`.
+fn admin_authorized(app: &App, req: &Request) -> bool {
+    match &app.admin_token {
+        None => false,
+        Some(t) => req
+            .bearer_token()
+            .map(|got| secgit_crypto::primitives::ct_eq(got.as_bytes(), t.as_bytes()))
+            .unwrap_or(false),
+    }
+}
+
+/// Operator-only: list queued abuse reports (decrypted inside the TEE, served over TLS).
+fn admin_list_abuse(app: &App, req: &Request) -> Response {
+    if !admin_authorized(app, req) {
+        return Response::text(401, "Unauthorized", "admin token required");
+    }
+    let reports = abuse::list(&app.store);
+    Response::json(&serde_json::json!({ "reports": reports }))
+}
+
+/// Operator-only: force-delete a repo by id (takedown). Wipes the working set + encrypted
+/// storage + directory record + ephemeral state, and records the takedown in the audit log.
+fn admin_takedown(app: &App, req: &Request) -> Response {
+    if !admin_authorized(app, req) {
+        return Response::text(401, "Unauthorized", "admin token required");
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+    let repo_id = body.get("repo_id").and_then(|v| v.as_str()).unwrap_or("");
+    if repo_id.is_empty() {
+        return Response::text(400, "Bad Request", "repo_id is required");
+    }
+    let _ = app.forge.delete(repo_id);
+    let _ = app.store.delete_repo(repo_id);
+    {
+        let mut identity = app.identity.lock().unwrap();
+        if let Some(RepoOwner::User(uid)) = identity.dir.get_repo(repo_id).map(|r| r.owner.clone())
+        {
+            let _ = app.quota.lock().unwrap().remove_repo(&uid, repo_id);
+        }
+        let _ = identity.dir.delete_repo(repo_id);
+    }
+    Metrics::inc(&app.metrics.takedowns_total);
+    if let Ok(mut log) = app.audit.lock() {
+        let _ = log.append(AuditEvent::Admin {
+            action: format!("takedown:{repo_id}"),
+            actor: "operator".into(),
+        });
+    }
+    Response::json(&serde_json::json!({ "deleted": true, "repo_id": repo_id }))
 }
 
 /// Serve a public image-transparency artifact (SBOM / image manifest) from the path in
@@ -570,8 +986,27 @@ fn transparency_file(env_var: &str) -> Response {
 fn landing(app: &App) -> Response {
     let cfg = &app.config;
     let pq = app.tls_spki_sha256_hex.is_some();
+    let sandbox_banner = if cfg.sandbox_mode {
+        "<p style=\"background:#fff8c5;border:1px solid #d4a72c;border-radius:6px;padding:10px 12px\">\
+         <strong>Public sandbox — do not push production secrets.</strong> This is a shared demo \
+         instance running in sandbox mode: repos are capped, anonymous repos auto-expire, and abuse \
+         controls are aggressive. Confidentiality still holds (that is the point you can verify), but \
+         treat it as ephemeral.</p>"
+    } else {
+        ""
+    };
+    let pow_note = if app.pow.enabled() {
+        format!(
+            "<li><a href=\"/sandbox/pow-challenge\">/sandbox/pow-challenge</a> — a lightweight \
+             proof-of-work ({} bits) is required before creating an anonymous repo.</li>",
+            app.pow.difficulty_bits()
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        "<h1>SecGit</h1>\
+        "{banner}\
+         <h1>SecGit</h1>\
          <p class=\"muted\">Confidential, attestation-backed, post-quantum hosting for private code. \
          The operator can't read your code, can't train on it, can't be subpoenaed into surrendering \
          it, and it's safe from harvest-now-decrypt-later — and all of this is <em>verifiable</em>.</p>\
@@ -579,6 +1014,7 @@ fn landing(app: &App) -> Response {
          <ol>\
          <li><a href=\"/attestation\">/attestation</a> — fetch a fresh SEV-SNP report bound to this \
              instance's TLS key (verify the chain to AMD roots with <code>secgit-verify</code>).</li>\
+         {pow}\
          <li><code>POST /sandbox/ephemeral</code> — get a throwaway, auto-expiring repo + push token, \
              push your own code over PQC-TLS, then confirm it's ciphertext-only on the host.</li>\
          <li><a href=\"/ui\">/ui</a> — browse repositories you can access.</li>\
@@ -589,8 +1025,21 @@ fn landing(app: &App) -> Response {
          <li><strong>Light</strong>: {light} — account-backed persistent capped repos.</li>\
          <li><strong>Managed</strong>: {managed} — org + BYOK + IdP (enterprise).</li>\
          </ul>\
+         <h2>Managed-tier waitlist</h2>\
+         <p class=\"muted\">Want a private org instance with BYOK-to-your-KMS and your IdP? Join the \
+         waitlist (your email is stored encrypted at rest, like everything else here):</p>\
+         <form method=\"post\" action=\"/waitlist\" onsubmit=\"event.preventDefault();fetch('/waitlist',\
+         {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{email:this.email.value}})}})\
+         .then(r=>{{this.nextElementSibling.textContent=r.ok?'Thanks — you are on the list.':'Please enter a valid email.';}});\">\
+         <input name=\"email\" type=\"email\" placeholder=\"you@company.com\" size=\"30\" required> \
+         <button>Join waitlist</button></form><p class=\"muted\"></p>\
+         <h2>Report abuse</h2>\
+         <p class=\"muted\">This instance can't read repo contents, so takedowns are by repo id: \
+         <code>POST /abuse/report</code> with <code>{{\"repo_id\":\"...\",\"reason\":\"...\"}}</code>.</p>\
          <p class=\"muted\">PQC-TLS in-CVM: {pq}. This public instance is the same OSS build run in \
          sandbox mode (a config, not a fork).</p>",
+        banner = sandbox_banner,
+        pow = pow_note,
         anon = on_off(cfg.anonymous_enabled),
         light = on_off(cfg.light_enabled),
         managed = on_off(cfg.managed_enabled),
@@ -644,10 +1093,31 @@ fn create_ephemeral(app: &App, req: &Request) -> Response {
     if !app.config.anonymous_enabled {
         return Response::text(403, "Forbidden", "anonymous tier disabled");
     }
-    let client_key = req.header("x-forwarded-for").unwrap_or("local").to_string();
+    // Optional proof-of-work gate (default off): raises the cost of automated spam beyond
+    // the per-IP rate limit. The challenge is bound to this client's IP.
+    if app.pow.enabled() {
+        let submission = req.header("x-secgit-pow").unwrap_or_default();
+        if !app.pow.verify(submission, &req.peer_ip) {
+            Metrics::inc(&app.metrics.pow_failures_total);
+            return Response::text(
+                402,
+                "Payment Required",
+                "proof-of-work required: GET /sandbox/pow-challenge, solve it, and resend with \
+                 header 'X-SecGit-PoW: <challenge>:<nonce>'",
+            );
+        }
+    }
+    // Rate-limit identity is the TCP peer IP (XFF is attacker-controlled; ADR 0007 forbids
+    // a trusted plaintext proxy). Falls back to a constant for local/unknown peers.
+    let client_key = if req.peer_ip.is_empty() {
+        "local".to_string()
+    } else {
+        req.peer_ip.clone()
+    };
     let mut eph = app.ephemeral.lock().unwrap();
     match eph.create(&client_key) {
         Ok(repo) => {
+            Metrics::inc(&app.metrics.ephemeral_created_total);
             if let Err(e) = app.forge.create_bare(&repo.repo_id) {
                 return Response::text(500, "Internal Server Error", &format!("create repo: {e}"));
             }
@@ -851,6 +1321,13 @@ fn git_route(app: &App, req: &Request) -> Response {
         return Response::text(404, "Not Found", "not found");
     };
 
+    // Per-IP git-operation rate limit (in addition to the global per-IP request limit).
+    if !app.rl.ip_git.check(&req.peer_ip) {
+        Metrics::inc(&app.metrics.rate_limited_total);
+        return Response::text(429, "Too Many Requests", "git rate limit exceeded")
+            .with_header("Retry-After", "1");
+    }
+
     // Determine whether this operation writes (push) so we can require the right role.
     let write = match endpoint {
         "receive-pack" => true,
@@ -900,7 +1377,15 @@ fn git_route(app: &App, req: &Request) -> Response {
         }
         let mut identity = app.identity.lock().unwrap();
         match authz::decide_identity(&mut identity, &repo_id, write, req) {
-            authz::Decision::Allow(_user) => {}
+            authz::Decision::Allow(user) => {
+                drop(identity);
+                // Per-account operation rate limit for authenticated repo access.
+                if !app.rl.account.check(&user) {
+                    Metrics::inc(&app.metrics.rate_limited_total);
+                    return Response::text(429, "Too Many Requests", "account rate limit exceeded")
+                        .with_header("Retry-After", "1");
+                }
+            }
             authz::Decision::NotFound => return Response::text(404, "Not Found", "unknown repo"),
             authz::Decision::Unauthenticated => {
                 return Response::text(401, "Unauthorized", "authentication required")
@@ -925,7 +1410,7 @@ fn git_route(app: &App, req: &Request) -> Response {
                 },
                 None => return Response::text(400, "Bad Request", "dumb http not supported"),
             };
-            match secgit_git::advertise_refs(&repo_path, svc) {
+            match secgit_git::advertise_refs_with_limits(&repo_path, svc, &app.limits.git) {
                 Ok(body) => Response::new(200, "OK", &svc.advertise_content_type(), body)
                     .with_header("Cache-Control", "no-cache"),
                 Err(e) => Response::text(500, "Internal Server Error", &format!("{e}")),
@@ -945,21 +1430,43 @@ fn run_rpc(
     req: &Request,
 ) -> Response {
     if svc == Service::ReceivePack {
+        // Per-repo push rate limit: directly bounds how often the O(repo-size)
+        // `seal_to_store` re-bundle can be triggered for a given repo.
+        if !app.rl.push.check(repo_id) {
+            Metrics::inc(&app.metrics.rate_limited_total);
+            return Response::text(429, "Too Many Requests", "push rate limit exceeded")
+                .with_header("Retry-After", "2");
+        }
         let is_ephemeral = app.ephemeral.lock().unwrap().is_ephemeral(repo_id);
         if is_ephemeral {
             let mut eph = app.ephemeral.lock().unwrap();
             if eph.account_bytes(repo_id, req.body.len() as u64).is_err() {
+                Metrics::inc(&app.metrics.push_rejected_total);
                 return Response::text(413, "Payload Too Large", "ephemeral size cap exceeded");
             }
         } else if !quota_check_push(app, repo_id, req.body.len() as u64) {
+            Metrics::inc(&app.metrics.push_rejected_total);
             return Response::text(413, "Payload Too Large", "account storage cap exceeded");
         }
     }
-    match secgit_git::rpc(repo_path, svc, &req.body) {
+    match secgit_git::rpc_with_limits(repo_path, svc, &req.body, &app.limits.git) {
         Ok(body) => {
             if svc == Service::ReceivePack {
-                // Persist the updated repo encrypted, and record the push.
-                let _ = app.forge.seal_to_store(repo_id, &app.store);
+                // Persist the updated repo encrypted, and record the push. The seal is now
+                // incremental (an O(delta) bundle appended as a segment; a periodic
+                // compaction folds segments back into a base), but still bound how many can
+                // run at once so a burst of pushes cannot exhaust CPU/memory.
+                {
+                    let _permit = app.seal_sem.acquire();
+                    let started = std::time::Instant::now();
+                    let _ = app.forge.seal_to_store(repo_id, &app.store);
+                    Metrics::inc(&app.metrics.seal_total);
+                    Metrics::add(
+                        &app.metrics.seal_millis_total,
+                        started.elapsed().as_millis() as u64,
+                    );
+                }
+                Metrics::inc(&app.metrics.push_total);
                 if let Ok(mut log) = app.audit.lock() {
                     let _ = log.append(AuditEvent::RefUpdated {
                         repo_id: repo_id.to_string(),
@@ -979,6 +1486,16 @@ fn run_rpc(
                 );
             }
             Response::new(200, "OK", &svc.result_content_type(), body)
+        }
+        Err(secgit_git::GitHttpError::LimitExceeded(msg)) => {
+            if svc == Service::ReceivePack {
+                Metrics::inc(&app.metrics.push_rejected_total);
+            }
+            Response::text(
+                413,
+                "Payload Too Large",
+                &format!("git limit exceeded: {msg}"),
+            )
         }
         Err(e) => Response::text(500, "Internal Server Error", &format!("{e}")),
     }

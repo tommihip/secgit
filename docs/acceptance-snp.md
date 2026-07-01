@@ -92,24 +92,29 @@ Before trusting any running instance, compute what a genuine launch of the publi
 the exact kernel cmdline):
 
 ```bash
-# One command: describe the exact launch context in a single JSON file and emit the digest.
-# (See deploy/snp-inputs.example.json. Explicit flags still work and override fields.)
-cargo run -p xtask -- snp-measure --inputs snp-inputs.json --out snp-reference.json
-
-# Equivalent fully-explicit form:
+# One command: the pinned launch descriptor names the EXACT OVMF + UKI, the cmdline, and the
+# vCPU topology (see deploy/snp-inputs.example.json). Cross-checking against the image
+# manifest binds the prediction to the reproducible build; explicit flags still override.
 cargo run -p xtask -- snp-measure \
-  --ovmf  OVMF.fd \
-  --kernel vmlinuz \
-  --initrd initrd.img \
+  --inputs snp-inputs.json \
+  --image-manifest image-manifest.json \
+  --out snp-reference.json
+
+# Equivalent fully-explicit form (UKI as the measured -kernel payload):
+cargo run -p xtask -- snp-measure \
+  --ovmf  deploy/guest/out/OVMF.fd \
+  --kernel deploy/guest/out/secgit-guest.efi \
   --append "<published kernel cmdline>" \
   --vcpus 4 --vcpu-type EPYC-v4 \
   --out snp-reference.json
 ```
 
-This wraps `sev-snp-measure` and writes `snp-reference.json` containing
-`measurement_hex` (the SHA-384 launch digest). Record this value `M_expected`. The same
-file is consumed by the harness (`acceptance-snp --reference snp-reference.json`) for the
-predicted-vs-live diff in §4c.
+This wraps `sev-snp-measure` and writes a **commit-bound** `snp-reference.json` containing
+`measurement_hex` (the SHA-384 launch digest), the source `git_commit`, and the recomputed
+`launch_artifacts` digests. `xtask` refuses to emit the reference if any launch artifact's
+digest disagrees with its pin or with `image-manifest.json`. Record `measurement_hex` as
+`M_expected`. The same file is consumed by the harness
+(`acceptance-snp --reference snp-reference.json`) for the predicted-vs-live diff in §4c.
 
 The same reference is published to the transparency log so a third party can confirm it
 matches the OSS release:
@@ -268,11 +273,21 @@ how often they bite:
    boots with, including ordering, whitespace, and any `root=`, `console=`, `ro/rw`, and
    initrd hand-off args. A single differing space changes the digest. Capture the live
    cmdline the operator configured and diff it against `snp-inputs.json`.
-2. **Firmware / OVMF build.** The `--ovmf` blob must be the exact published firmware. A
-   distro-patched OVMF, a different build date, or SMM/secure-boot variants all differ.
-3. **Kernel + initrd artifacts.** Use the published `vmlinuz`/`initrd.img`; a locally
-   regenerated initrd (different compression, mtimes, or module set) will not match. Build
-   the initrd reproducibly: pin `SOURCE_DATE_EPOCH`, sort inputs, strip timestamps.
+2. **Firmware / OVMF build.** The `--ovmf` blob must be the exact published firmware, pinned
+   in `deploy/guest/ovmf.pin.json`. For **measured direct boot** it MUST be built from
+   `OvmfPkg/AmdSev/AmdSevX64.dsc` (a single `OVMF.fd` carrying the `SNP_KERNEL_HASHES`
+   section) and launched with `kernel-hashes=on`; a stock `OvmfPkgX64.dsc` build omits the
+   kernel/initrd/cmdline from the measurement. A distro-patched OVMF or different build date
+   also differs.
+3. **Kernel + initrd artifacts (the UKI).** SecGit fuses kernel+initrd+cmdline into a single
+   reproducible UKI (`deploy/guest/mkosi.conf`); pass that UKI as the measured `--kernel`.
+   A locally regenerated UKI (different compression, mtimes, or module set) will not match —
+   build it reproducibly (pinned `SOURCE_DATE_EPOCH`, Debian snapshot, sorted inputs).
+   `[VERIFY] / decision:` SecGit targets the `sev-snp-measure` OVMF measured-direct-boot path
+   (recorded as `vmm_launch_method` in the descriptor). If your host instead launches via
+   **IGVM** (some newer QEMU/cloud-hypervisor stacks), the measurement is computed over the
+   IGVM file with `igvmmeasure`, not OVMF+kernel+initrd — set `vmm_launch_method` accordingly
+   and use the matching tool. Confirm which path the target host uses before the run.
 4. **vCPU count and type (`--vcpus`, `--vcpu-type`).** The measurement includes the VMSA for
    each vCPU; `4`/`EPYC-v4` here must equal the launch topology exactly. Genoa vs Milan vCPU
    types differ.

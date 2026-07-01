@@ -7,3 +7,7 @@
 /.secgit-data
 *.kek
 *.dek
+# Provenance signing PRIVATE key bundle (public vk is committed at deploy/provenance.vk.json).
+# The private bundle must live offline / in an HSM and must NEVER be committed.
+provenance-signing-key.json
+*.signing-key.json

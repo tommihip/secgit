@@ -43,6 +43,9 @@ thiserror = "2"
 anyhow = "1"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
+# Unix process-group control (setpgid via process_group(0) at spawn; killpg on timeout)
+# so a git subprocess and its grandchildren (e.g. `pack-objects`) are killed as a unit.
+libc = "0.2"
 
 # Read-side git plumbing. NOTE: gitoxide has no server-side receive-pack and only a
 # nascent upload-pack; transfer is handled by shelling out to canonical `git`.

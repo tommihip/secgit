@@ -168,8 +168,9 @@ everything outside is assumed hostile.
 
 ## 4. Residual costs and explicit non-goals
 
-- **`git bundle --all` re-seal cost:** confidentiality is at the object/pack layer; certain
-  operations re-seal whole-repo bundles, an accepted performance cost of the design.
+- **Incremental seal cost:** confidentiality is at the object/pack layer; pushes append
+  O(delta) bundle segments rather than re-bundling the whole repo, with a periodic full
+  compaction folding segments into a base — an accepted, bounded amortized cost of the design.
 - **`configfs-tsm` trust:** the guest kernel's TSM interface is inside the measured TCB; a
   bug there is a TCB bug, caught (if it changes the image) by the measurement gate.
 - **Confidential CI is v2:** running untrusted build steps against plaintext materially
@@ -210,12 +211,15 @@ Every feature that ever holds plaintext ships a test using `secgit-leaktest`:
    - on the wire: `assert_bytes_absent(wire_buffer, canary, "tls wire")`.
 
 A green run is not a proof of confidentiality, but a leak is a definitive disproof. Current
-adopters: `secgit-store`, `secgit-audit`, `secgit-server` (TLS). New B-phase
-plaintext-touching features MUST add a leak-test before merge.
+adopters: `secgit-store`, `secgit-audit`, `secgit-server` (TLS), **per-tier repo storage**
+(`bins/secgit-server/tests/tier_leaktest.rs` — anonymous/Light/Managed), the **encrypted
+abuse queue** (`abuse::reports_persist_and_are_ciphertext_at_rest`), and the **content-free
+metrics** surface (`metrics::metrics_are_content_free`). New plaintext-touching or
+operator-visible features MUST add a leak-test before merge.
 
 ---
 
-## 8. Verification mapping (T1–T12)
+## 8. Verification mapping (T1–T14)
 
 Every threat maps to a concrete, runnable proof. **Gate** says where it runs: `CI(mock)`
 runs in `cargo test` with no hardware; `gated-on-silicon` requires a real SEV-SNP CVM and is
@@ -237,3 +241,5 @@ transcript exists on real silicon (see `docs/STATUS.md`).
 | **T10** subpoena | follows from T1/T4/T7 (operator holds only ciphertext, cannot derive the KEK) — no separate test; verified by the on-silicon acceptance | gated-on-silicon (documented) |
 | **T11** no-AI-training | `xtask` `no_ml_or_telemetry_deps_in_graph`, `egress_check_detects_a_planted_dependency`; `cargo deny check` ban-list; T1/T2 leak-tests | CI(mock) |
 | **T12** audit tamper/fork | `merkle::{inclusion_named_non_pow2_sizes, inclusion_wrong_tree_size_is_rejected, consistency_named_non_pow2_sizes, tampered_inclusion_fails, consistency_rejects_forked_history}`, `audit::corrupted_file_is_rejected_on_load`; `secgit-verify verify-checkpoint` | CI(mock) |
+| **T13** public-sandbox abuse/DoS | `http::tests::*` (conn/body/header/chunked caps), `ratelimit::tests::*` (token-bucket + concurrency semaphore), `secgit-git` `GitLimits` + subprocess watchdog, bounded seal concurrency; encrypted abuse queue + audit-logged takedown (`abuse::*`) | CI(mock) |
+| **T14** per-tier confidentiality + content-free observability | `bins/secgit-server/tests/tier_leaktest.rs` (anonymous/Light/Managed ciphertext at rest), `tls::loopback_observer_sees_only_ciphertext` (on-wire), `metrics::metrics_are_content_free` (metrics leak nothing; no telemetry egress) | CI(mock) |

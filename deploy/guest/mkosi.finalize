@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# mkosi finalize hook — the seam that layers SecGit's reproducibly-built binaries into the
+# guest rootfs before the UKI is assembled. mkosi runs this with $BUILDROOT pointing at the
+# staged root filesystem.
+#
+# STATUS: M7 seam. Today this is a documented placeholder that FAILS LOUDLY unless the
+# caller exports SECGIT_OCI_ROOTFS pointing at a rootfs extracted from the reproducible OCI
+# image (deploy/Dockerfile). This keeps the trust chain honest: the guest must carry the
+# exact binaries the OCI reproducibility gate (deploy/repro-build.sh) verified, not a
+# separately-compiled copy.
+set -euo pipefail
+
+: "${BUILDROOT:?mkosi must set BUILDROOT}"
+
+if [ -z "${SECGIT_OCI_ROOTFS:-}" ]; then
+  echo "mkosi.finalize: SECGIT_OCI_ROOTFS not set." >&2
+  echo "  M7 wires this: build the OCI image with deploy/repro-build.sh, export its rootfs" >&2
+  echo "  (docker create + docker export | tar -x), and point SECGIT_OCI_ROOTFS at it so the" >&2
+  echo "  guest carries the byte-identical, digest-verified secgit-server / secgit-verify." >&2
+  exit 1
+fi
+
+install -D -m 0755 "$SECGIT_OCI_ROOTFS/usr/local/bin/secgit-server" "$BUILDROOT/usr/local/bin/secgit-server"
+install -D -m 0755 "$SECGIT_OCI_ROOTFS/usr/local/bin/secgit-verify" "$BUILDROOT/usr/local/bin/secgit-verify"
+install -D -m 0644 "$SECGIT_OCI_ROOTFS/usr/local/share/secgit/sbom.json" "$BUILDROOT/usr/local/share/secgit/sbom.json"
+install -D -m 0644 "$SECGIT_OCI_ROOTFS/usr/local/share/secgit/image-manifest.json" "$BUILDROOT/usr/local/share/secgit/image-manifest.json"
+
+# The finalize hook runs from the mkosi config directory; our co-located guest assets
+# (egress allowlist + boot service) live next to this script.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# In-guest egress allowlist, MEASURED into the UKI: default-drop outbound, allow only AMD
+# KDS (+ optional KBS) and the service ingress. Because it ships inside the measured guest,
+# the untrusted host cannot silently relax it without changing the launch measurement.
+install -D -m 0644 "$here/nftables.conf" "$BUILDROOT/etc/nftables.conf"
+ln -sf /lib/systemd/system/nftables.service \
+  "$BUILDROOT/etc/systemd/system/multi-user.target.wants/nftables.service" 2>/dev/null || true
+
+# Boot-time attestation-gated launch: secgit-server performs the RCAR KEK release BEFORE it
+# opens the encrypted store. The unit carries NO KEK — the key is released into the CVM only
+# after attestation (SECGIT_SNP_REFERENCE pins the measurement; SECGIT_KBS_URL is optional).
+install -D -m 0644 "$here/secgit.service" "$BUILDROOT/etc/systemd/system/secgit.service"
+mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/secgit.service \
+  "$BUILDROOT/etc/systemd/system/multi-user.target.wants/secgit.service"
+
+echo "mkosi.finalize: imported SecGit binaries, egress allowlist, and boot service into the guest."

@@ -178,6 +178,34 @@ outside the TEE only ciphertext exists. See `crates/secgit-store` and `docs/adr/
 (Per-owner / customer-controlled KEKs and BYOK — wrapping each owner's DEKs under their own
 KEK instead of the shared instance KEK — are the designed-but-not-yet-wired enterprise step.)
 
+## Solving the anonymous ephemeral proof-of-work (optional gate)
+
+If the public sandbox runs with the hashcash PoW gate on (`SECGIT_POW=1`), fetch a
+challenge, find a nonce whose `sha256("<challenge>:<nonce>")` has enough leading zero bits,
+and resend it as a header. It is intentionally CLI-friendly:
+
+```bash
+host=https://localhost:8080
+ch=$(curl -sk "$host/sandbox/pow-challenge")
+challenge=$(printf '%s' "$ch" | sed -n 's/.*"challenge":"\([^"]*\)".*/\1/p')
+bits=$(printf '%s' "$ch" | sed -n 's/.*"difficulty_bits":\([0-9]*\).*/\1/p')
+# Brute-force a nonce meeting the leading-zero-bit target (small for a demo instance).
+nonce=0
+while :; do
+  h=$(printf '%s:%s' "$challenge" "$nonce" | shasum -a 256 | cut -d' ' -f1)
+  # count leading zero bits of the hex digest
+  zbits=$(python3 -c "import sys;d=bytes.fromhex(sys.argv[1]);n=0
+for b in d:
+  if b==0: n+=8
+  else:
+    n+=8-b.bit_length(); break
+print(n)" "$h")
+  [ "$zbits" -ge "$bits" ] && break
+  nonce=$((nonce+1))
+done
+curl -sk -X POST "$host/sandbox/ephemeral" -H "X-SecGit-PoW: $challenge:$nonce"
+```
+
 ## What does NOT work on macOS (by design)
 
 - **`secgit-verify probe-snp`** prints a clear `N/A` (real SEV-SNP requires an AMD x86 CVM)

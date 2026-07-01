@@ -15,6 +15,39 @@ pub struct Request {
     pub query: HashMap<String, String>,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// The TCP peer IP (set by the connection handler). This is the *trusted* client
+    /// identity for rate limiting — `X-Forwarded-For` is attacker-controlled because ADR
+    /// 0007 forbids a trusted plaintext proxy in front of the CVM.
+    pub peer_ip: String,
+}
+
+/// Bounds applied while parsing a request, so a hostile client cannot exhaust memory or
+/// hang the parser (slowloris) with monstrous headers or a giant/absent body.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpLimits {
+    pub max_header_bytes: usize,
+    pub max_header_count: usize,
+    pub max_body_bytes: usize,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            max_header_bytes: 64 * 1024,
+            max_header_count: 100,
+            max_body_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
+/// Result of parsing a request under [`HttpLimits`].
+pub enum ParseOutcome {
+    /// A well-formed request within all limits.
+    Request(Request),
+    /// The peer closed the connection with no request (EOF).
+    Closed,
+    /// The request violated a limit or was malformed; send this response and close.
+    Reject(Response),
 }
 
 impl Request {
@@ -128,34 +161,106 @@ impl Response {
     }
 }
 
-pub fn parse_request<S: Read>(stream: &mut S) -> std::io::Result<Option<Request>> {
-    let mut reader = BufReader::new(stream);
+/// Outcome of reading a single (bounded) line.
+enum LineOutcome {
+    Line(String),
+    Eof,
+    TooLong,
+}
 
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(None);
+/// Read one CRLF/LF-terminated line, charging each byte against `budget`. Returns
+/// [`LineOutcome::TooLong`] if the shared header budget is exhausted before a newline —
+/// bounding both a single monstrous line and the whole header block, and defeating a
+/// slowloris that trickles bytes without ever completing the request (the socket read
+/// timeout, set by the caller, bounds the trickle in time).
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    budget: &mut usize,
+) -> std::io::Result<LineOutcome> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = reader.read(&mut byte)?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(LineOutcome::Eof);
+            }
+            break;
+        }
+        if *budget == 0 {
+            return Ok(LineOutcome::TooLong);
+        }
+        *budget -= 1;
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
     }
+    Ok(LineOutcome::Line(
+        String::from_utf8_lossy(&buf).into_owned(),
+    ))
+}
+
+fn headers_too_large() -> Response {
+    Response::text(431, "Request Header Fields Too Large", "headers too large")
+}
+
+/// Parse an HTTP/1.1 request under [`HttpLimits`]. See [`ParseOutcome`].
+pub fn parse_request<S: Read>(
+    stream: &mut S,
+    limits: &HttpLimits,
+) -> std::io::Result<ParseOutcome> {
+    let mut reader = BufReader::new(stream);
+    let mut budget = limits.max_header_bytes;
+
+    let request_line = match read_capped_line(&mut reader, &mut budget)? {
+        LineOutcome::Eof => return Ok(ParseOutcome::Closed),
+        LineOutcome::TooLong => return Ok(ParseOutcome::Reject(headers_too_large())),
+        LineOutcome::Line(l) => l,
+    };
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let raw_target = parts.next().unwrap_or("").to_string();
     if method.is_empty() || raw_target.is_empty() {
-        return Ok(None);
+        return Ok(ParseOutcome::Reject(Response::text(
+            400,
+            "Bad Request",
+            "malformed request line",
+        )));
     }
 
     let (path, query) = split_target(&raw_target);
 
     let mut headers = HashMap::new();
+    let mut header_count = 0usize;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
+        let line = match read_capped_line(&mut reader, &mut budget)? {
+            LineOutcome::Eof => break,
+            LineOutcome::TooLong => return Ok(ParseOutcome::Reject(headers_too_large())),
+            LineOutcome::Line(l) => l,
+        };
         let line = line.trim_end();
         if line.is_empty() {
             break;
         }
+        header_count += 1;
+        if header_count > limits.max_header_count {
+            return Ok(ParseOutcome::Reject(headers_too_large()));
+        }
         if let Some((k, v)) = line.split_once(':') {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+
+    // Chunked transfer-encoding is not supported by this minimal server; reject it
+    // explicitly rather than silently ignoring the body framing.
+    if let Some(te) = headers.get("transfer-encoding") {
+        if te.to_ascii_lowercase().contains("chunked") {
+            return Ok(ParseOutcome::Reject(Response::text(
+                400,
+                "Bad Request",
+                "chunked transfer-encoding is not supported",
+            )));
         }
     }
 
@@ -163,17 +268,29 @@ pub fn parse_request<S: Read>(stream: &mut S) -> std::io::Result<Option<Request>
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if content_length > limits.max_body_bytes {
+        return Ok(ParseOutcome::Reject(Response::text(
+            413,
+            "Payload Too Large",
+            "request body exceeds the configured limit",
+        )));
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body)?;
+        // A lying Content-Length (bytes promised but never sent) blocks here until the
+        // caller's socket read timeout fires, at which point we drop the connection.
+        if reader.read_exact(&mut body).is_err() {
+            return Ok(ParseOutcome::Closed);
+        }
     }
 
-    Ok(Some(Request {
+    Ok(ParseOutcome::Request(Request {
         method,
         path,
         query,
         headers,
         body,
+        peer_ip: String::new(),
     }))
 }
 
@@ -236,4 +353,95 @@ pub fn write_response<S: Write>(stream: &mut S, resp: &Response) -> std::io::Res
     stream.write_all(head.as_bytes())?;
     stream.write_all(&resp.body)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn parse(bytes: &[u8], limits: HttpLimits) -> ParseOutcome {
+        let mut c = Cursor::new(bytes.to_vec());
+        parse_request(&mut c, &limits).unwrap()
+    }
+
+    #[test]
+    fn parses_a_normal_request() {
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+        match parse(req, HttpLimits::default()) {
+            ParseOutcome::Request(r) => {
+                assert_eq!(r.method, "GET");
+                assert_eq!(r.path, "/healthz");
+            }
+            _ => panic!("expected a parsed request"),
+        }
+    }
+
+    #[test]
+    fn parses_body_within_cap() {
+        let req = b"POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        match parse(req, HttpLimits::default()) {
+            ParseOutcome::Request(r) => assert_eq!(r.body, b"hello"),
+            _ => panic!("expected a parsed request"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_body_without_allocating_it() {
+        let limits = HttpLimits {
+            max_body_bytes: 8,
+            ..HttpLimits::default()
+        };
+        // Claims a huge body; we must reject on Content-Length before allocating.
+        let req = b"POST /x HTTP/1.1\r\nContent-Length: 1000000000000\r\n\r\n";
+        match parse(req, limits) {
+            ParseOutcome::Reject(resp) => assert_eq!(resp.status, 413),
+            _ => panic!("expected 413 rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_headers() {
+        let limits = HttpLimits {
+            max_header_bytes: 40,
+            ..HttpLimits::default()
+        };
+        let mut req = b"GET / HTTP/1.1\r\nX-Big: ".to_vec();
+        req.extend(std::iter::repeat_n(b'a', 200));
+        req.extend_from_slice(b"\r\n\r\n");
+        match parse(&req, limits) {
+            ParseOutcome::Reject(resp) => assert_eq!(resp.status, 431),
+            _ => panic!("expected 431 rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_too_many_headers() {
+        let limits = HttpLimits {
+            max_header_count: 2,
+            ..HttpLimits::default()
+        };
+        let req = b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n";
+        match parse(req, limits) {
+            ParseOutcome::Reject(resp) => assert_eq!(resp.status, 431),
+            _ => panic!("expected 431 rejection"),
+        }
+    }
+
+    #[test]
+    fn rejects_chunked_encoding() {
+        let req = b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        match parse(req, HttpLimits::default()) {
+            ParseOutcome::Reject(resp) => assert_eq!(resp.status, 400),
+            _ => panic!("expected 400 rejection"),
+        }
+    }
+
+    #[test]
+    fn empty_stream_is_closed() {
+        assert!(matches!(
+            parse(b"", HttpLimits::default()),
+            ParseOutcome::Closed
+        ));
+    }
 }

@@ -114,7 +114,7 @@ Deeper reading: the [threat model (as-built)](docs/threat-model.md) and the [arc
 
 SecGit is built so a skeptical third party can check the load-bearing claims without trusting the operator *or* the SecGit project:
 
-1. **The running service is the open-source code** — the SNP launch measurement equals the reproducible build ([`xtask snp-measure`](xtask/)).
+1. **The running service is the open-source code** — the SNP launch measurement equals the reproducible build's published, **commit-bound** reference ([`xtask snp-measure`](xtask/) → PQC-signed transparency log), and rebuilding from that git commit reproduces the image bit-for-bit.
 2. **The attestation is genuine** — the SNP report verifies to AMD KDS roots (`VCEK → ASK → ARK`, with revocation checked and fail-closed).
 3. **The channel is the attested TEE** — channel binding defeats a relayed report from a different machine.
 4. **The disk holds only ciphertext** — `grep` for a planted canary finds nothing.
@@ -135,9 +135,9 @@ Depth on the verifiable confidential claim first; floor on commodity forge featu
 - [x] **M2 — Confidential storage + minimal forge:** envelope-encrypted store, gix reads + git-CLI pack engine, smart-HTTP server.
 - [x] **M3 — Transparency-log audit:** hash-chain + Merkle, PQC-signed checkpoints, inclusion/consistency proofs.
 - [x] **M4 — Identity + access control:** User/Org/Repo model, OIDC + local auth.
-- [ ] **M5 — Reproducible builds + image transparency:** bind launch measurement to the OSS build.
-- [ ] **M6 — Demo-as-sandbox tiers:** public instance with abuse/DoS controls.
-- [ ] **M7 — Packaging:** OCI + Compose for a confidential VM, hardening.
+- [x] **M5 — Reproducible builds + image transparency:** OCI build is bit-for-bit reproducible (CI build-twice gate), and the *git commit → reproducible image → predicted launch measurement* chain is published as a commit-bound, PQC-signed transparency artifact. Guest UKI assembly is scaffolded/pinned *(MOCK-VERIFIED; live measurement/silicon transcript pending — same gate as M1).*
+- [x] **M6 — Demo-as-sandbox tiers:** public instance hardened for a hostile internet — bounded connections + socket timeouts (slowloris), header/body-size caps, per-IP/-account/-repo token-bucket rate limits, git-pack + subprocess wall-clock/size bounds with **process-group kill** of git grandchildren, **incremental O(delta) append-only sealing** (encrypted delta segments + bounded compaction), ephemeral GC + startup reconciliation, an optional hashcash PoW gate, an encrypted abuse-report queue with audit-logged operator takedown, and **content-free** (token-gated, localhost-default) metrics. Per-tier leak-tests prove the confidentiality invariant holds for anonymous/Light/Managed *(MOCK-VERIFIED)*.
+- [x] **M7 — Packaging → attestable CVM guest:** reproducible OCI **plus** guest-image assembly — a reproducible OVMF (`OvmfPkg/AmdSev` + `SNP_KERNEL_HASHES`) and a **SecureBoot-signed UKI with a dm-verity root** whose predicted launch measurement is bound to the OSS build (`deploy/guest/build-ovmf.sh`, `build-guest.sh`, `launch-snp.sh`), a `configfs-tsm`-capable (≥ 6.7) guest kernel pinned from a reproducible snapshot, PQC-native in-toto/SLSA **provenance signing** with a **persistent release key** (`xtask provenance-keygen` → published `deploy/provenance.vk.json` → `secgit-verify verify-provenance`, no sigstore/Fulcio/Rekor), runtime hardening beyond Compose (default-deny seccomp, mem/CPU limits, and an in-guest **no-plaintext-egress** nftables allowlist baked into the measured UKI), boot-time attestation-gated KEK release with a no-secrets-in-image gate (`deploy/verify-no-secrets.sh`), an upgrade/backup runbook ([`docs/operations.md`](docs/operations.md)), and one-command bring-up (`deploy/up.sh --mock|--snp`) *(MOCK-VERIFIED; guest built on Linux; silicon boot pending).*
 - [ ] **Silicon acceptance:** publish the signed SEV-SNP transcript that promotes the core claims to `SILICON-VERIFIED`.
 
 ## Contributing

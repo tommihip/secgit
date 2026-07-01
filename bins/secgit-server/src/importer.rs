@@ -89,15 +89,10 @@ pub fn import_github(app: &App, req: &Request, user: &str) -> Response {
             return Response::text(500, "Internal Server Error", &format!("register repo: {e}"));
         }
     }
-    // Track the imported repo in quota accounting (best-effort).
+    // Track the imported repo in quota accounting (best-effort). `sealed_size` sums the
+    // incremental seal segments without decrypting anything.
     {
-        let bytes = app
-            .store
-            .get(&repo_id, "repo.bundle")
-            .ok()
-            .flatten()
-            .map(|b| b.len() as u64)
-            .unwrap_or(0);
+        let bytes = app.forge.sealed_size(&repo_id, &app.store).unwrap_or(0);
         app.quota
             .lock()
             .unwrap()

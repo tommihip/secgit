@@ -39,7 +39,15 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+      # Default-DENY syscall allowlist (returns EPERM for anything unlisted), tighter than
+      # Docker's default deny-list profile. See deploy/seccomp-secgit.json.
+      - seccomp:./seccomp-secgit.json
     pids_limit: 512
+    # Resource caps: bound the blast radius of a compromised/looping process. Tune to the
+    # host; these are conservative dev defaults (a real CVM sizes these to the guest).
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2.0
     healthcheck:
       test: ["CMD", "/usr/local/bin/secgit-verify", "selftest"]
       interval: 30s

@@ -1,0 +1,12 @@
+{
+  "_comment": "Pinned provenance for the OVMF firmware that measured-direct-boots the SecGit guest UKI. The firmware is part of the SEV-SNP launch measurement, so it MUST be built reproducibly from a pinned source and its digest pinned here. Measured direct boot requires the AmdSev target (OvmfPkg/AmdSev/AmdSevX64.dsc), which emits a single OVMF.fd carrying the SNP_KERNEL_HASHES metadata section and enables kernel-hashes=on at launch; the stock OvmfPkgX64.dsc build will NOT work. HOW TO FILL: run `EDK2_COMMIT=<reviewed-sha> deploy/guest/build-ovmf.sh` on a Linux host; it builds OVMF.fd reproducibly and writes edk2_commit + sha384_hex back into this file. deploy/snp-inputs.example.json references this file and deploy/guest/build-guest.sh binds the digest into snp-reference.json.",
+  "component": "ovmf",
+  "edk2_repo": "https://github.com/tianocore/edk2",
+  "edk2_commit": "REPLACE_WITH_PINNED_EDK2_COMMIT_SHA",
+  "build_target": "OvmfPkg/AmdSev/AmdSevX64.dsc",
+  "toolchain": "GCC5",
+  "artifact": "OVMF.fd",
+  "sha384_hex": "REPLACE_WITH_SHA384_OF_BUILT_OVMF_FD",
+  "requires_kernel_hashes": true,
+  "note": "kernel-hashes=on must be set on the sev-snp-guest QEMU object so the kernel/initrd/cmdline hashes are folded into the launch measurement. See docs/acceptance-snp.md and docs/packaging.md."
+}

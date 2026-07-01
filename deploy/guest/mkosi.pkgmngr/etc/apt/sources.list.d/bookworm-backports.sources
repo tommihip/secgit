@@ -1,0 +1,11 @@
+# Build-time apt source (injected into mkosi's package-manager sandbox, NOT the final image).
+#
+# Enables the bookworm-backports suite from the SAME pinned Debian snapshot used by the
+# main mirror in mkosi.conf, so the >= 6.7 backports kernel we install for configfs-tsm
+# support is byte-reproducible across rebuilds. Keep the snapshot date in lockstep with
+# mkosi.conf's Mirror= and deploy/Dockerfile's DEBIAN_SNAPSHOT.
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian/20240701T000000Z/
+Suites: bookworm-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg

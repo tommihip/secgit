@@ -19,12 +19,26 @@ The verifiability claim ("running image == audited OSS build") requires:
 - `xtask measure <artifacts...>` -> deterministic SHA-384 digests + `image-manifest.json`.
 - `xtask emit-transparency <manifest> <log>` -> append to a PQC-signed transparency log.
 - `xtask verify-image <manifest> <sha384>` -> check a digest is published.
+- `xtask snp-measure --inputs <descriptor> --image-manifest <manifest> --log <log>` ->
+  recompute launch-input digests (fail-closed on mismatch), bind the source `git_commit`,
+  and emit a commit-bound `snp-reference.json` published to the transparency log.
+
+## Update (M5): resolved sub-decisions and the commit-bound chain
+- **OCI reproducibility is CI-gated.** `deploy/Dockerfile` pins base images by digest, apt
+  by Debian snapshot, threads `SOURCE_DATE_EPOCH` (with BuildKit `rewrite-timestamp`), and
+  uses `--locked` + `--remap-path-prefix`. `deploy/repro-build.sh` builds twice and fails on
+  any digest drift (CI `reproducibility` job). This is the precondition for claim 5.
+- **Guest toolchain sub-decision resolved: mkosi -> UKI** (closes the ADR 0010 "plain cargo
+  vs Nix" residual for the guest image). `deploy/guest/` scaffolds a reproducible UKI build
+  and pins the OVMF firmware provenance (`ovmf.pin.json`); actual assembly is M7.
+- **Chain published:** git commit -> reproducible image -> predicted launch measurement,
+  emitted as a signed transparency artifact and diffed predicted-vs-live by the acceptance
+  harness.
 
 ## `[VERIFY]`
-The exact launch-context measurement is produced by `sev-snp-measure` over the VM
-launch context; wiring it (and TDX MRTD) to the reproducible artifacts is an M5 task on
-real silicon. `xtask` manages the manifest/transparency plumbing around it today.
-
-## Residual sub-decision
-Reproducible-build toolchain specifics (plain cargo + pinned toolchain vs Nix) — see
-ADR 0010.
+The exact launch-context measurement is produced by `sev-snp-measure` over the VM launch
+context (OVMF measured-direct-boot of the UKI, `kernel-hashes=on`, OVMF built from
+`AmdSev/AmdSevX64.dsc`); the descriptor records `vmm_launch_method` so an **IGVM** launch
+path (measured with `igvmmeasure`) can be swapped in. The live predicted-vs-live match (and
+TDX MRTD) remains an on-silicon task (M7 + acceptance). `xtask` manages the manifest /
+transparency / prediction plumbing around it today.

@@ -33,6 +33,29 @@ pub type Result<T> = core::result::Result<T, StoreError>;
 const DEK_FILE: &str = "dek.wrapped";
 const OBJECTS_DIR: &str = "objects";
 
+/// Object key of the append-only seal manifest.
+///
+/// The manifest is an opaque (to the store) JSON document whose schema is owned by
+/// `secgit-forge`; it records the ordered list of seal segments and the git ref tips each
+/// segment covers, so a repo can be sealed incrementally (O(delta)) instead of re-bundling
+/// the whole repo on every push. Like every object it is encrypted under the repo DEK and
+/// AAD-bound to `(repo_id, SEAL_MANIFEST_KEY)`.
+pub const SEAL_MANIFEST_KEY: &str = "seal.manifest";
+
+/// Legacy single-bundle object key used by repos sealed before incremental sealing.
+///
+/// A repo with this object but no [`SEAL_MANIFEST_KEY`] predates segmented sealing; the
+/// forge treats it as segment 0 (the base) when it first migrates the repo to a manifest.
+pub const LEGACY_BUNDLE_KEY: &str = "repo.bundle";
+
+/// Object key for seal segment `index` (a git bundle covering a delta of refs).
+///
+/// Zero-padded so the lexical order of the underlying object names is irrelevant (the
+/// manifest defines segment order anyway) and so the space is effectively unbounded.
+pub fn segment_key(index: u32) -> String {
+    format!("bundle/{index:08}")
+}
+
 /// An encrypted object store rooted at a directory, unlocked by an in-memory KEK.
 pub struct EncryptedStore {
     root: PathBuf,
@@ -132,6 +155,45 @@ impl EncryptedStore {
         }
         Ok(())
     }
+
+    /// Store seal segment `index` (a git bundle covering a delta of refs).
+    pub fn put_segment(&self, repo_id: &str, index: u32, bytes: &[u8]) -> Result<()> {
+        self.put(repo_id, &segment_key(index), bytes)
+    }
+
+    /// Fetch seal segment `index`, if present.
+    pub fn get_segment(&self, repo_id: &str, index: u32) -> Result<Option<Vec<u8>>> {
+        self.get(repo_id, &segment_key(index))
+    }
+
+    /// Remove seal segment `index` (used by compaction). Idempotent.
+    pub fn delete_segment(&self, repo_id: &str, index: u32) -> Result<()> {
+        self.delete(repo_id, &segment_key(index))
+    }
+
+    /// Store the append-only seal manifest (opaque JSON; schema owned by `secgit-forge`).
+    pub fn put_manifest(&self, repo_id: &str, bytes: &[u8]) -> Result<()> {
+        self.put(repo_id, SEAL_MANIFEST_KEY, bytes)
+    }
+
+    /// Fetch the seal manifest, if the repo has been migrated to segmented sealing.
+    pub fn get_manifest(&self, repo_id: &str) -> Result<Option<Vec<u8>>> {
+        self.get(repo_id, SEAL_MANIFEST_KEY)
+    }
+
+    /// Remove **all** persisted state for a repo (its wrapped DEK and every object).
+    ///
+    /// Used by the sandbox GC / takedown path to reclaim storage for expired ephemeral
+    /// repos or removed content. After this call the repo id looks un-initialized again.
+    /// The directory name is a SHA-256 of the repo id, so no plaintext id is exposed even
+    /// while wiping. Idempotent: a missing repo is not an error.
+    pub fn delete_repo(&self, repo_id: &str) -> Result<()> {
+        let dir = self.repo_dir(repo_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -175,6 +237,62 @@ mod tests {
         let repo = canary.as_str();
         store.put(repo, "k", canary.as_bytes()).unwrap();
         assert_dir_ciphertext_nonempty(&dir, &[canary.as_bytes()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_repo_wipes_all_state() {
+        let dir = tmpdir("delrepo");
+        let store = EncryptedStore::open(&dir, SymKey::generate().unwrap()).unwrap();
+        store
+            .put("ephemeral/abcd", "repo.bundle", b"ciphertext")
+            .unwrap();
+        assert!(store.repo_exists("ephemeral/abcd"));
+        store.delete_repo("ephemeral/abcd").unwrap();
+        assert!(!store.repo_exists("ephemeral/abcd"));
+        assert_eq!(store.get("ephemeral/abcd", "repo.bundle").unwrap(), None);
+        // Idempotent.
+        store.delete_repo("ephemeral/abcd").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segments_and_manifest_roundtrip_and_stay_ciphertext() {
+        use secgit_leaktest::assert_dir_ciphertext_nonempty;
+        let dir = tmpdir("segments");
+        let store = EncryptedStore::open(&dir, SymKey::generate().unwrap()).unwrap();
+        let repo = "user/alice/repo";
+
+        store
+            .put_manifest(repo, br#"{"version":1,"segments":[]}"#)
+            .unwrap();
+        store.put_segment(repo, 0, b"BASE-BUNDLE-BYTES").unwrap();
+        store.put_segment(repo, 1, b"DELTA-BUNDLE-BYTES").unwrap();
+
+        assert_eq!(
+            store.get_manifest(repo).unwrap().as_deref(),
+            Some(&b"{\"version\":1,\"segments\":[]}"[..])
+        );
+        assert_eq!(
+            store.get_segment(repo, 0).unwrap().as_deref(),
+            Some(&b"BASE-BUNDLE-BYTES"[..])
+        );
+        assert_eq!(
+            store.get_segment(repo, 1).unwrap().as_deref(),
+            Some(&b"DELTA-BUNDLE-BYTES"[..])
+        );
+        assert_eq!(store.get_segment(repo, 2).unwrap(), None);
+
+        // Distinct segment keys map to distinct objects.
+        assert_ne!(segment_key(0), segment_key(1));
+
+        // Compaction can drop a delta by index; the base and manifest survive.
+        store.delete_segment(repo, 1).unwrap();
+        assert_eq!(store.get_segment(repo, 1).unwrap(), None);
+        assert!(store.get_segment(repo, 0).unwrap().is_some());
+
+        // The bundle payloads must be ciphertext at rest (never the plaintext bytes).
+        assert_dir_ciphertext_nonempty(&dir, &[b"BASE-BUNDLE-BYTES", b"DELTA-BUNDLE-BYTES"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

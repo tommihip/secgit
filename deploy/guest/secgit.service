@@ -1,0 +1,50 @@
+# SecGit boot-time, attestation-gated launch (inside the SEV-SNP guest).
+#
+# The KEK is NEVER baked into the image or this unit. On start, secgit-server performs the
+# RCAR attestation-gated key release into CVM memory BEFORE it opens the encrypted store
+# (see bins/secgit-server/src/main.rs): it fetches an SNP report via configfs-tsm, and either
+# a self-hosted key broker (SECGIT_KBS_URL) releases the KEK KEM-sealed to the guest's
+# ephemeral key, or a local broker enforces the pinned measurement. If attestation fails, no
+# key is released and the store stays sealed.
+#
+# Non-secret operator configuration (KBS URL, product, reference path, listen addr) is read
+# from /etc/secgit/secgit.env, which contains NO key material. SECGIT_DEV_KEK_HEX and
+# SECGIT_INSECURE_HTTP MUST NOT appear there on a real guest.
+[Unit]
+Description=SecGit confidential forge (attestation-gated)
+After=network-online.target nftables.service
+Wants=network-online.target
+Requires=nftables.service
+
+[Service]
+Type=simple
+# SECGIT_SNP_REFERENCE pins the launch measurement; SECGIT_KBS_URL (optional) points at the
+# self-hosted key broker. This file carries configuration only — never the KEK.
+EnvironmentFile=-/etc/secgit/secgit.env
+Environment=SECGIT_DATA=/data
+Environment=SECGIT_ADDR=0.0.0.0:8443
+ExecStart=/usr/local/bin/secgit-server
+Restart=on-failure
+RestartSec=2
+
+# Runtime hardening (mirrors the Compose profile; the whole guest is already memory-encrypted).
+User=secgit
+Group=secgit
+DynamicUser=no
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data
+# The server needs the guest attestation-report interface; everything else stays read-only.
+DeviceAllow=/dev/sev-guest rw
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

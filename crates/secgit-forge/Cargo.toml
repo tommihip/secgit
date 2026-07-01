@@ -10,6 +10,13 @@ description = "Minimal Rust forge: gix for reads, git CLI as the pack engine"
 secgit-store.workspace = true
 gix.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Kill the whole git process group (child + grandchildren like `pack-objects`) on a
+# timeout. Unix-only; other targets fall back to a direct child kill.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 secgit-crypto.workspace = true

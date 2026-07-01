@@ -19,21 +19,64 @@ transparency log), and inspect the dependency graph (SBOM) and per-binary digest
 
 ## Reproducible build
 
-The image (`deploy/Dockerfile`) is built for determinism:
+The image (`deploy/Dockerfile`) is built for **bit-for-bit** determinism — the necessary
+precondition for binding the launch measurement to the OSS build:
 
-- **Pinned Rust toolchain** (`ARG RUST_VERSION`) and a pinned base image digest in CI.
-- **`SOURCE_DATE_EPOCH`** is threaded into the build so timestamps are stable.
-- **`cargo build --locked`** enforces `Cargo.lock`; no dependency may float.
-- The runtime stage carries only the two static-ish binaries plus `git` and CA certs.
+- **Pinned Rust toolchain** (`ARG RUST_VERSION`) plus **base images pinned by digest**
+  (`RUST_DIGEST` / `RUNTIME_DIGEST`; a moving tag silently breaks determinism).
+- **apt frozen to a Debian snapshot** (`ARG DEBIAN_SNAPSHOT` -> `snapshot.debian.org`) so
+  system package versions do not float between rebuilds.
+- **`SOURCE_DATE_EPOCH`** is threaded in, and layer file timestamps are rewritten at export
+  by BuildKit (`--output ...,rewrite-timestamp=true`, BuildKit >= 0.13).
+- **`cargo build --locked`** enforces `Cargo.lock`, `CARGO_INCREMENTAL=0`, and
+  `--remap-path-prefix` strips absolute build paths (`/src`, the cargo registry) from the
+  binaries.
+- The runtime stage carries only the two binaries plus `git` and CA certs, with a fixed
+  uid/gid for a deterministic `passwd`/`group`.
 
-Build locally:
+Resolve and pin the base digests (do this deliberately, then commit the values into CI):
 
 ```bash
-docker build -f deploy/Dockerfile \
-  --build-arg RUST_VERSION=1.89.0 \
-  --build-arg SOURCE_DATE_EPOCH=1700000000 \
-  -t secgit/secgit-server:dev .
+docker buildx imagetools inspect rust:1.89.0-bookworm --format '{{.Manifest.Digest}}'
+docker buildx imagetools inspect debian:bookworm-slim  --format '{{.Manifest.Digest}}'
 ```
+
+Build locally (reproducible export):
+
+```bash
+SOURCE_DATE_EPOCH=1700000000 docker buildx build -f deploy/Dockerfile \
+  --build-arg RUST_VERSION=1.89.0 \
+  --build-arg RUST_DIGEST=@sha256:... \
+  --build-arg RUNTIME_DIGEST=@sha256:... \
+  --build-arg SOURCE_DATE_EPOCH=1700000000 \
+  --output type=oci,dest=secgit.tar,rewrite-timestamp=true .
+```
+
+### Verify reproducibility (build twice, compare)
+
+`deploy/repro-build.sh` builds the image twice from scratch (`--no-cache`) and fails unless
+both builds produce the **same manifest digest**. This runs in CI (the `reproducibility`
+job) and is the gate behind claim 12 in `docs/STATUS.md`:
+
+```bash
+./deploy/repro-build.sh
+# [PASS] OCI image is bit-for-bit reproducible: sha256:...
+```
+
+### Rebuild from source (independent verifier)
+
+A skeptical third party rebuilds without trusting SecGit or the operator:
+
+1. `git clone` the repo and `git checkout <the published git_commit from snp-reference.json>`.
+2. Run `./deploy/repro-build.sh` with the **same** `RUST_DIGEST`, `RUNTIME_DIGEST`,
+   `DEBIAN_SNAPSHOT`, and `SOURCE_DATE_EPOCH` the release recorded.
+3. Confirm the resulting image digest matches the published one, and that
+   `xtask measure` reproduces the per-binary SHA-384 in `/image-manifest`.
+4. Feed those artifacts into the launch-measurement prediction (below) and confirm it
+   equals the value pinned in the published, transparency-logged `snp-reference.json`.
+
+If the rebuild does not converge bit-for-bit, the chain to "the published source" is broken
+— that is a reproducible-build defect, fixed here, not an SNP defect.
 
 ## Image-transparency artifacts
 
@@ -59,13 +102,51 @@ Generate the SBOM outside Docker too:
 cargo run -p xtask -- sbom Cargo.lock sbom.json
 ```
 
-## Publishing the launch measurement
+## Guest image assembly (mkosi -> UKI) — the M7 seam
 
-The on-silicon launch measurement is computed with `xtask snp-measure` (wrapping
-`sev-snp-measure` over OVMF + kernel + initrd + cmdline) and appended to the PQC-signed
-transparency log via `xtask emit-transparency`. `Policy.allowed_measurements` is fed from
-that log, so the server only accepts attestations matching a published OSS build. See
-`docs/acceptance-snp.md` for the end-to-end on-hardware acceptance test.
+The SEV-SNP launch measurement is a SHA-384 fold over the exact bytes the CVM boots. For
+**measured direct boot**, that is the OVMF firmware plus the kernel, initrd, and kernel
+command line. SecGit fuses kernel+initrd+cmdline into a single **Unified Kernel Image (UKI)**
+so there is one measured payload:
+
+- `deploy/guest/mkosi.conf` builds the guest reproducibly (`Format=uki`, Debian snapshot
+  pinned to match the Dockerfile) and `deploy/guest/mkosi.finalize` layers in the
+  byte-identical `secgit-server`/`secgit-verify` from the reproducible OCI rootfs (so the
+  guest carries exactly what the reproducibility gate verified — not a separate compile).
+- `deploy/guest/ovmf.pin.json` pins the firmware provenance. Measured direct boot requires
+  OVMF built from `OvmfPkg/AmdSev/AmdSevX64.dsc` (emitting a single `OVMF.fd` with the
+  `SNP_KERNEL_HASHES` metadata section) and `kernel-hashes=on` on the QEMU `sev-snp-guest`
+  object; the stock `OvmfPkgX64.dsc` build will NOT include the kernel/initrd/cmdline in the
+  measurement.
+
+The actual bootable-guest build/boot is **M7**; it is scaffolded and pinned here so the
+prediction below targets a concrete, reproducible guest rather than an abstract input.
+
+## Publishing the launch measurement (commit-bound)
+
+`xtask snp-measure` predicts the launch measurement from a **pinned launch descriptor**
+(`deploy/snp-inputs.example.json`) that names the exact OVMF and UKI, the cmdline, the vCPU
+count/type (the measurement includes the per-vCPU VMSA), and the `vmm_launch_method`. It:
+
+1. recomputes the SHA-384 of every declared launch artifact and refuses on any mismatch with
+   the descriptor's pinned digest (and, via `--image-manifest`, with `image-manifest.json`
+   where they overlap);
+2. records the source `git_commit` and the recomputed digests into `snp-reference.json`;
+3. appends `commit -> measurement` to the PQC-signed transparency log.
+
+```bash
+cargo run -p xtask -- snp-measure \
+  --inputs snp-inputs.json \
+  --image-manifest image-manifest.json \
+  --log transparency.log \
+  --out snp-reference.json
+```
+
+This produces the documented chain **git commit -> reproducible image -> predicted launch
+measurement**, published as a signed transparency artifact. `Policy.allowed_measurements` is
+fed from `snp-reference.json` (`SECGIT_SNP_REFERENCE`), so the server only accepts
+attestations matching a published OSS build, and the acceptance harness diffs this predicted
+value against the live report. See `docs/acceptance-snp.md` for the on-hardware test.
 
 ## Runtime hardening (`deploy/docker-compose.yml`)
 

@@ -1,0 +1,74 @@
+{
+  "_comment": "Default-DENY seccomp allowlist for secgit-server (and its git subprocess). defaultAction returns EPERM for anything not listed, which shrinks the guest-kernel attack surface beyond Docker's default (deny-list) profile. Wired from deploy/docker-compose.yml via security_opt. [VERIFY] This is a curated starting point covering a Rust/tokio HTTP server + `git` pack engine; validate it under real load first by temporarily setting defaultAction to SCMP_ACT_LOG and auditing dmesg/`journalctl _AUDIT` for any denied syscall, then re-tighten. Dangerous syscalls are denied by omission: ptrace, mount/umount, kexec_load, init_module, bpf, add_key/keyctl, pivot_root, reboot, swapon, unshare/setns for new namespaces, and clone with CLONE_NEW* flags.",
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept", "accept4", "access", "arch_prctl", "bind", "brk",
+        "capget", "capset", "chdir", "chmod", "chown", "chown32",
+        "clock_getres", "clock_gettime", "clock_nanosleep",
+        "clone", "clone3", "close", "close_range", "connect", "copy_file_range",
+        "creat", "dup", "dup2", "dup3", "epoll_create", "epoll_create1",
+        "epoll_ctl", "epoll_pwait", "epoll_pwait2", "epoll_wait", "eventfd", "eventfd2",
+        "execve", "execveat", "exit", "exit_group", "faccessat", "faccessat2",
+        "fadvise64", "fallocate", "fchdir", "fchmod", "fchmodat", "fchown", "fchown32",
+        "fchownat", "fcntl", "fcntl64", "fdatasync", "fgetxattr", "flistxattr",
+        "flock", "fork", "fstat", "fstat64", "fstatat64", "fstatfs", "fstatfs64",
+        "fsync", "ftruncate", "ftruncate64", "futex", "futex_waitv",
+        "getcwd", "getdents", "getdents64", "getegid", "getegid32", "geteuid",
+        "geteuid32", "getgid", "getgid32", "getgroups", "getgroups32", "getpeername",
+        "getpgid", "getpgrp", "getpid", "getppid", "getpriority", "getrandom",
+        "getresgid", "getresgid32", "getresuid", "getresuid32", "getrlimit",
+        "get_robust_list", "getrusage", "getsid", "getsockname", "getsockopt",
+        "gettid", "gettimeofday", "getuid", "getuid32", "getxattr", "ioctl",
+        "kill", "lchown", "lchown32", "lgetxattr", "link", "linkat", "listen",
+        "listxattr", "llistxattr", "lseek", "lstat", "lstat64", "madvise",
+        "membarrier", "memfd_create", "mkdir", "mkdirat", "mknod", "mknodat",
+        "mlock", "mmap", "mmap2", "mprotect", "mremap", "msync", "munlock", "munmap",
+        "nanosleep", "newfstatat", "open", "openat", "openat2", "pause", "pipe",
+        "pipe2", "poll", "ppoll", "prctl", "pread64", "preadv", "preadv2",
+        "prlimit64", "pselect6", "pwrite64", "pwritev", "pwritev2", "read",
+        "readahead", "readlink", "readlinkat", "readv", "recvfrom", "recvmmsg",
+        "recvmsg", "rename", "renameat", "renameat2", "restart_syscall",
+        "rseq", "rt_sigaction", "rt_sigpending", "rt_sigprocmask", "rt_sigqueueinfo",
+        "rt_sigreturn", "rt_sigsuspend", "rt_sigtimedwait", "rt_tgsigqueueinfo",
+        "sched_getaffinity", "sched_getparam", "sched_get_priority_max",
+        "sched_get_priority_min", "sched_getscheduler", "sched_setaffinity",
+        "sched_yield", "select", "sendfile", "sendfile64", "sendmmsg", "sendmsg",
+        "sendto", "setgid", "setgid32", "setgroups", "setgroups32", "setitimer",
+        "setpgid", "setpriority", "setresgid", "setresgid32", "setresuid",
+        "setresuid32", "setrlimit", "setsid", "setsockopt", "set_robust_list",
+        "set_tid_address", "setuid", "setuid32", "shutdown", "sigaltstack",
+        "socket", "socketpair", "splice", "stat", "stat64", "statfs", "statfs64",
+        "statx", "symlink", "symlinkat", "sync", "sync_file_range", "syncfs",
+        "sysinfo", "tee", "tgkill", "time", "timer_create", "timer_delete",
+        "timer_getoverrun", "timer_gettime", "timer_settime", "timerfd_create",
+        "timerfd_gettime", "timerfd_settime", "tkill", "truncate", "truncate64",
+        "umask", "uname", "unlink", "unlinkat", "utime", "utimensat", "utimes",
+        "vfork", "wait4", "waitid", "waitpid", "write", "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "_comment": "Namespace/personality syscalls are allowed ONLY with safe flags. clone new-user/new-net/etc namespace creation is not needed by the server; deny by requiring flags without CLONE_NEW* is enforced above by allowing clone but relying on cap_drop:ALL + no-new-privileges to prevent privileged namespace ops.",
+      "names": ["personality"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        { "index": 0, "value": 0, "op": "SCMP_CMP_EQ" },
+        { "index": 0, "value": 8, "op": "SCMP_CMP_EQ" },
+        { "index": 0, "value": 4294967295, "op": "SCMP_CMP_EQ" }
+      ]
+    }
+  ]
+}

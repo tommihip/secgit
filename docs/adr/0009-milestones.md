@@ -23,7 +23,14 @@ end-to-end," not "fewer features than GitHub."
 - **M5 Reproducible builds + image transparency** — `xtask`; bind launch measurement
   to the OSS build so "running image == OSS build" is user-verifiable.
 - **M6 Demo-as-sandbox tiers** — `secgit-api` (anonymous ephemeral repo, light
-  account) + public instance with abuse/DoS controls.
+  account) + public instance with abuse/DoS controls. **Delivered (MOCK-VERIFIED):**
+  transport hardening (connection cap, socket timeouts/slowloris, header/body caps,
+  chunked rejection), memory-bounded per-IP/-account/-repo token-bucket rate limits keyed
+  on the TCP peer IP, git-pack + subprocess wall-clock/size bounds (`fsckObjects`), bounded
+  `seal_to_store` (push-rate + seal-concurrency + bundle wall-clock), ephemeral GC +
+  startup reconciliation, an optional hashcash PoW gate (default off), an encrypted
+  abuse-report queue with audit-logged operator takedown, content-free token-gated
+  metrics, and per-tier confidentiality leak-tests. See ADR 0007 for the control detail.
 - **M7 Packaging** — OCI + Compose for a confidential VM (`deploy/`); hardening.
 
 ## Out of v1

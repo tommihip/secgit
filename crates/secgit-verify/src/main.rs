@@ -23,6 +23,10 @@ use secgit_crypto::aead::SymKey;
 use secgit_crypto::sig::VerifyingKey;
 use secgit_keybroker::{attest_and_unwrap, InMemoryKekProvider, LocalKeyBroker};
 
+/// The project's published provenance verifying key (committed). `verify-provenance` defaults
+/// to it so a user can check a release signature without being handed a key out-of-band.
+const DEFAULT_PROVENANCE_VK: &str = "deploy/provenance.vk.json";
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -46,6 +50,21 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("acceptance-snp") => acceptance::run_acceptance(&args[2..]),
+        Some("verify-provenance") => {
+            let p = args.get(2).context(
+                "usage: verify-provenance <provenance.json> <provenance.json.sig> [vk.json]",
+            )?;
+            let sig = args.get(3).context(
+                "usage: verify-provenance <provenance.json> <provenance.json.sig> [vk.json]",
+            )?;
+            // The verifying key defaults to the project's PUBLISHED release key so an end user
+            // can check a release without being handed a key out-of-band.
+            let vk = args
+                .get(4)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_PROVENANCE_VK);
+            verify_provenance(p, sig, vk)
+        }
         Some("verify-transcript") => {
             let t = args
                 .get(2)
@@ -64,6 +83,9 @@ fn main() -> Result<()> {
             eprintln!("                 [--reference snp-reference.json] [--vcek-cache DIR]");
             eprintln!("                 [--out acceptance-transcript.json] [--mock]");
             eprintln!("                 [--expect-refuse SCENARIO]");
+            eprintln!(
+                "  verify-provenance <provenance.json> <provenance.json.sig> <verifying_key.json>"
+            );
             eprintln!("  verify-transcript <transcript.json> <verifying_key.json>");
             std::process::exit(2);
         }
@@ -179,6 +201,123 @@ fn verify_checkpoint(cp_path: &str, vk_path: &str) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// In-toto Statement mirror (must match `xtask`'s struct so re-serialization reproduces the
+/// exact signed bytes). The signed bytes are the COMPACT serialization, in struct-field order.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Subject {
+    name: String,
+    digest: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProvenancePredicate {
+    build_type: String,
+    builder_id: String,
+    snp_measurement_hex: String,
+    vmm_launch_method: String,
+    git_commit: String,
+    source_date_epoch: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProvenanceStatement {
+    #[serde(rename = "_type")]
+    type_: String,
+    predicate_type: String,
+    subject: Vec<Subject>,
+    predicate: ProvenancePredicate,
+}
+
+/// Verify a PQC-signed provenance statement the way a skeptical user would: (1) the hybrid
+/// signature verifies under the published verifying key, and (2) every subject digest still
+/// matches the local artifact bytes (for artifacts the verifier has on hand). Signature
+/// failure is fatal; a missing local artifact is a NOTE (the verifier may not have it).
+fn verify_provenance(statement_path: &str, sig_path: &str, vk_path: &str) -> Result<()> {
+    let statement: ProvenanceStatement = serde_json::from_slice(
+        &std::fs::read(statement_path).with_context(|| format!("reading {statement_path}"))?,
+    )
+    .context("parsing provenance.json")?;
+    let sig_hex =
+        std::fs::read_to_string(sig_path).with_context(|| format!("reading {sig_path}"))?;
+    let sig = hex::decode(sig_hex.trim()).context("provenance signature is not valid hex")?;
+    if !std::path::Path::new(vk_path).is_file() {
+        bail!(
+            "verifying key {vk_path} not found. Pass an explicit vk path, or run from a checkout \
+             that has the published {DEFAULT_PROVENANCE_VK}."
+        );
+    }
+    if vk_path == DEFAULT_PROVENANCE_VK {
+        println!("using the published provenance verifying key: {vk_path}");
+    }
+    let vk: VerifyingKey =
+        serde_json::from_slice(&std::fs::read(vk_path)?).context("parsing verifying_key.json")?;
+
+    // Reconstruct the canonical signed bytes (compact, struct order) and verify BOTH halves.
+    let canonical = serde_json::to_vec(&statement).context("re-serializing statement")?;
+    if let Err(e) = secgit_crypto::sig::verify(&vk, &canonical, &sig) {
+        println!("[FAIL] provenance signature invalid: {e}");
+        std::process::exit(1);
+    }
+    step(
+        true,
+        &format!(
+            "provenance hybrid PQC signature valid (measurement={}, commit={})",
+            statement.predicate.snp_measurement_hex, statement.predicate.git_commit
+        ),
+    )?;
+
+    // Cross-check each subject digest against local files if present. Search the cwd and the
+    // guest output dir; recompute sha384/sha256 and compare.
+    let search_dirs = [
+        std::path::PathBuf::from("."),
+        std::path::PathBuf::from("deploy/guest/out"),
+    ];
+    let mut checked = 0usize;
+    for s in &statement.subject {
+        let mut found_path: Option<std::path::PathBuf> = None;
+        for d in &search_dirs {
+            let p = d.join(&s.name);
+            if p.is_file() {
+                found_path = Some(p);
+                break;
+            }
+        }
+        let Some(p) = found_path else {
+            println!(
+                "  [NOTE] {} not present locally — skipping digest cross-check",
+                s.name
+            );
+            continue;
+        };
+        let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+        for (alg, want) in &s.digest {
+            let got = match alg.as_str() {
+                "sha384" => hex::encode(secgit_crypto::primitives::sha384(&bytes)),
+                "sha256" => hex::encode(secgit_crypto::primitives::sha256(&bytes)),
+                other => {
+                    println!("  [NOTE] {} unknown digest alg {other} — skipping", s.name);
+                    continue;
+                }
+            };
+            step(
+                got.eq_ignore_ascii_case(want),
+                &format!("{} {alg} matches local bytes ({})", s.name, p.display()),
+            )?;
+            checked += 1;
+        }
+    }
+
+    if checked == 0 {
+        println!(
+            "\nSignature verified. No local artifacts were available to cross-check digests; \
+             fetch the published OVMF/UKI/SBOM and re-run in that directory to bind the bytes."
+        );
+    } else {
+        println!("\nProvenance verified: signature valid and {checked} local digest(s) matched.");
+    }
+    Ok(())
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

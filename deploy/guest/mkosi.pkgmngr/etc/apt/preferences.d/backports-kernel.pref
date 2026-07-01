@@ -1,0 +1,8 @@
+# Prefer the bookworm-backports kernel (>= 6.7, with CONFIG_TSM / CONFIG_SEV_GUEST for
+# configfs-tsm) over the bookworm stock 6.1 kernel, while leaving everything else on stable.
+#
+# Priority 600 > the default 500 for the target release, so apt selects the backports kernel
+# meta/ABI packages; all other packages keep their stable versions (no broad backports pull).
+Package: linux-image-cloud-amd64 linux-image-*-cloud-amd64 linux-headers-cloud-amd64 linux-headers-*-cloud-amd64
+Pin: release a=bookworm-backports
+Pin-Priority: 600

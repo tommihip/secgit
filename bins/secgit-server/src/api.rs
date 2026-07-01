@@ -301,7 +301,14 @@ fn limits(app: &App, user: &str) -> Response {
             "max_bytes_per_repo": light.max_bytes_per_repo,
             "max_total_bytes": light.max_total_bytes,
         },
+        "anonymous_limits": {
+            "ephemeral_ttl_secs": cfg.ephemeral_ttl_secs,
+            "ephemeral_max_bytes": cfg.ephemeral_max_bytes,
+            "creates_per_window": cfg.anon_creates_per_window,
+            "rate_window_secs": cfg.rate_window_secs,
+        },
         "your_usage": { "repos": repos, "total_bytes": bytes },
+        "managed_waitlist": "POST /waitlist {\"email\":\"...\"}",
     }))
 }
 

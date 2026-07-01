@@ -137,6 +137,7 @@ mod tests {
             query: HashMap::new(),
             headers,
             body: vec![],
+            peer_ip: String::new(),
         }
     }
 
