@@ -91,10 +91,22 @@ RUN set -eux; \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until; \
     apt-get update; \
     apt-get install -y --no-install-recommends git ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
+    # Reproducibility scrub: apt/dpkg and ldconfig stamp wall-clock times and a host-specific
+    # cache into these files. BuildKit's rewrite-timestamp normalises file MTIMES but not file
+    # CONTENT, so two independent rebuilds would otherwise embed different seconds here and the
+    # image digests would diverge. None of this is needed at runtime; removing it in the SAME
+    # layer that created it leaves only a deterministic whiteout.
+    rm -rf /var/lib/apt/lists/* \
+           /var/log/apt /var/log/dpkg.log /var/log/alternatives.log \
+           /var/cache/ldconfig/aux-cache
 # Non-root runtime user with a fixed uid/gid (deterministic passwd/group entries).
-RUN groupadd --system --gid 10001 secgit \
-    && useradd --system --create-home --uid 10001 --gid 10001 secgit
+RUN set -eux; \
+    groupadd --system --gid 10001 secgit; \
+    useradd --system --create-home --uid 10001 --gid 10001 secgit; \
+    # Pin the shadow "last password change" day to the SOURCE_DATE_EPOCH day. useradd defaults
+    # it to the current day, which would differ on every calendar date and break reproducibility
+    # ACROSS TIME (an independent verifier rebuilding on another day would get a different digest).
+    chage -d "$(( SOURCE_DATE_EPOCH / 86400 ))" secgit
 COPY --from=build /src/target/release/secgit-server /usr/local/bin/secgit-server
 COPY --from=build /src/target/release/secgit-verify /usr/local/bin/secgit-verify
 COPY --from=build /out/sbom.json /usr/local/share/secgit/sbom.json
