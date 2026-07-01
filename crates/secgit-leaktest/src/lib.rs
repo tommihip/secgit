@@ -17,6 +17,13 @@
 //! makes regressions in the trust-critical path observable.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-wide monotonic counter mixed into every canary. This is what *guarantees*
+/// uniqueness: the address/pid/clock inputs can all repeat across two rapid calls (same stack
+/// frame, same pid, and a clock that may not advance within a nanosecond), so without a
+/// strictly-increasing term two `Canary::new` calls can collide.
+static CANARY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A unique, high-entropy marker embedded into test content so a search for it on an
 /// operator-visible surface is unambiguous (no false positives from incidental bytes).
@@ -28,9 +35,10 @@ pub struct Canary {
 impl Canary {
     /// Create a canary with the given human label and process-unique entropy.
     ///
-    /// Entropy is derived without extra deps from the address-space-randomized address of a
-    /// stack local, the process id, and a monotonic clock — sufficient to make collisions
-    /// across a test run vanishingly unlikely.
+    /// Uniqueness is guaranteed by a strictly-increasing process-wide counter ([`CANARY_SEQ`]),
+    /// placed in the high bits so it cannot be cancelled by the low-bit entropy. The
+    /// address-space-randomized stack address, the process id, and a monotonic clock are folded
+    /// in as well so canaries are also unpredictable, not just distinct.
     pub fn new(label: &str) -> Self {
         let stack = 0u8;
         let addr = (&stack as *const u8) as usize;
@@ -39,7 +47,12 @@ impl Canary {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let raw = ((addr as u128) ^ ((pid as u128) << 64)).wrapping_add(nanos);
+        let seq = CANARY_SEQ.fetch_add(1, Ordering::Relaxed);
+        // Low bits: unpredictable per-call entropy (addr/pid/clock). High bits: the monotonic
+        // sequence, which occupies bit 96+ (above where addr, pid<<64, and the added nanos land)
+        // so two calls always differ even when every other input repeats.
+        let raw = (((addr as u128) ^ ((pid as u128) << 64)).wrapping_add(nanos))
+            ^ ((seq as u128) << 96);
         Self {
             value: format!("SECGIT-CANARY-{label}-{:032x}", raw),
         }
@@ -140,10 +153,16 @@ mod tests {
 
     #[test]
     fn canaries_are_unique() {
-        let a = Canary::new("repo");
-        let b = Canary::new("repo");
-        assert_ne!(a.as_str(), b.as_str());
-        assert!(a.as_str().starts_with("SECGIT-CANARY-repo-"));
+        // Many rapid same-label calls: the monotonic sequence must keep them all distinct even
+        // when the stack address, pid, and clock inputs repeat within the loop.
+        use std::collections::HashSet;
+        let n = 10_000;
+        let mut seen = HashSet::with_capacity(n);
+        for _ in 0..n {
+            let c = Canary::new("repo");
+            assert!(c.as_str().starts_with("SECGIT-CANARY-repo-"));
+            assert!(seen.insert(c.value.clone()), "duplicate canary: {}", c.as_str());
+        }
     }
 
     #[test]
