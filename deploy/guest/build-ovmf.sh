@@ -26,7 +26,7 @@
 #   EDK2_COMMIT        edk2 commit to build (falls back to ovmf.pin.json edk2_commit)
 #   EDK2_REPO          edk2 git remote (default: from ovmf.pin.json)
 #   SOURCE_DATE_EPOCH  fixed build epoch (default 1700000000; matches everything else)
-#   DEBIAN_SNAPSHOT    builder base snapshot (default 20240701T000000Z; matches Dockerfile)
+#   DEBIAN_SNAPSHOT    builder base snapshot (default 20260615T000000Z; matches Dockerfile)
 #   BUILD_LOCAL=1      skip the container and build on the host toolchain
 set -euo pipefail
 
@@ -36,7 +36,7 @@ out_dir="$guest_dir/out"
 pin_file="$guest_dir/ovmf.pin.json"
 
 : "${SOURCE_DATE_EPOCH:=1700000000}"
-: "${DEBIAN_SNAPSHOT:=20240701T000000Z}"
+: "${DEBIAN_SNAPSHOT:=20260615T000000Z}"
 export SOURCE_DATE_EPOCH
 
 # Pull pinned values out of ovmf.pin.json (python3 for robust JSON parsing; no jq dep).
@@ -97,7 +97,9 @@ else
   fi
   echo ">>> building OVMF in a pinned Debian-snapshot container (deterministic toolchain)"
   # Pin the builder toolchain to the same Debian snapshot the rest of the build uses so the
-  # firmware bytes do not float with the host's package versions.
+  # firmware bytes do not float with the host's package versions. The base image is pinned by
+  # digest (matching deploy/Dockerfile's RUNTIME_DIGEST) and DEBIAN_SNAPSHOT is kept >= that
+  # image's build date, so apt only ever upgrades its pre-installed packages, never downgrades.
   builder_setup='
 set -eux
 printf "Types: deb\nURIs: https://snapshot.debian.org/archive/debian/'"$DEBIAN_SNAPSHOT"'/\nSuites: bookworm\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n" > /etc/apt/sources.list.d/debian.sources
@@ -110,7 +112,7 @@ apt-get install -y --no-install-recommends \
   docker run --rm \
     -e SOURCE_DATE_EPOCH \
     -v "$out_dir":"$out_dir" \
-    debian:bookworm-slim \
+    debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df \
     bash -c "$builder_setup"$'\n'"$build_script"
 fi
 

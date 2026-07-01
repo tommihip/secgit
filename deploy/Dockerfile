@@ -15,16 +15,25 @@
 #     absolute build paths are embedded in the binaries.
 
 ARG RUST_VERSION=1.89.0
-# Pin the base images by digest. Default is empty (tag-only) so a plain `docker build`
-# still works for local iteration; RELEASE / CI builds MUST pass the resolved digests
-# (repro-build.sh enforces this). Resolve with:
+# Pin the base images by digest (the `@sha256:...` prefix is baked into the FROM lines
+# below). Pinning is REQUIRED, not optional: a bare tag floats to the latest point release,
+# and when the base image drifts ahead of the frozen apt snapshot its pre-installed packages
+# (e.g. perl-base) become NEWER than anything the snapshot offers, so `apt-get install` can no
+# longer satisfy an exact-version dependency and dies with "held broken packages". The two
+# levers must therefore move together: whenever you re-pin a digest below, bump DEBIAN_SNAPSHOT
+# to the newest snapshot.debian.org capture at/near that image's build date (see the note on the
+# snapshot ARG), so apt only upgrades the image's packages, never downgrades. Re-resolve with:
 #   docker buildx imagetools inspect rust:1.89.0-bookworm --format '{{.Manifest.Digest}}'
 #   docker buildx imagetools inspect debian:bookworm-slim  --format '{{.Manifest.Digest}}'
-ARG RUST_DIGEST=
-ARG RUNTIME_DIGEST=
+ARG RUST_DIGEST=@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff
+ARG RUNTIME_DIGEST=@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 # Debian snapshot timestamp: freezes apt package versions to a point in time so two
-# independent rebuilds resolve identical dependencies. Bump deliberately, never floatingly.
-ARG DEBIAN_SNAPSHOT=20240701T000000Z
+# independent rebuilds resolve identical dependencies. Bump deliberately, never floatingly, and
+# keep it close to (and never far behind) the RUNTIME_DIGEST base image's build date: the
+# snapshot must be able to UPGRADE the base image's pre-installed packages, never be asked to
+# downgrade them. debian:bookworm-slim @60eac75 was built 2026-06-24; this points at the newest
+# snapshot.debian.org capture at pinning time, which carries the same perl-base (5.36.0-7+deb12u3).
+ARG DEBIAN_SNAPSHOT=20260615T000000Z
 ARG SOURCE_DATE_EPOCH=1700000000
 
 FROM rust:${RUST_VERSION}-bookworm${RUST_DIGEST} AS build

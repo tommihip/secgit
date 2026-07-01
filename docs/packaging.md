@@ -25,7 +25,11 @@ precondition for binding the launch measurement to the OSS build:
 - **Pinned Rust toolchain** (`ARG RUST_VERSION`) plus **base images pinned by digest**
   (`RUST_DIGEST` / `RUNTIME_DIGEST`; a moving tag silently breaks determinism).
 - **apt frozen to a Debian snapshot** (`ARG DEBIAN_SNAPSHOT` -> `snapshot.debian.org`) so
-  system package versions do not float between rebuilds.
+  system package versions do not float between rebuilds. The snapshot date MUST be **>= the
+  pinned base image's build date**: apt has to be able to *upgrade* the image's pre-installed
+  packages, never downgrade them. A stale snapshot against a fresher pinned base fails with
+  `perl : Depends: perl-base (= ...u1) but ...u3 is to be installed` / "held broken packages".
+  Re-pin the digest and bump the snapshot together.
 - **`SOURCE_DATE_EPOCH`** is threaded in, and layer file timestamps are rewritten at export
   by BuildKit (`--output ...,rewrite-timestamp=true`, BuildKit >= 0.13).
 - **`cargo build --locked`** enforces `Cargo.lock`, `CARGO_INCREMENTAL=0`, and

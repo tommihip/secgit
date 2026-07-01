@@ -13,21 +13,26 @@
 #   deploy/repro-build.sh
 # Environment (all optional; release/CI SHOULD pin the base digests):
 #   SOURCE_DATE_EPOCH  fixed build timestamp (default 1700000000)
-#   DEBIAN_SNAPSHOT    Debian snapshot.debian.org timestamp (default 20240701T000000Z)
+#   DEBIAN_SNAPSHOT    Debian snapshot.debian.org timestamp (default 20260615T000000Z)
 #   RUST_VERSION       rust base tag (default 1.89.0)
 #   RUST_DIGEST        "@sha256:..." pin for rust:${RUST_VERSION}-bookworm
 #   RUNTIME_DIGEST     "@sha256:..." pin for debian:bookworm-slim
 #   KEEP_ARTIFACTS=1   copy the two OCI tarballs out for inspection on mismatch
+#
+# The default digests below are pinned and MUST stay in lockstep with DEBIAN_SNAPSHOT and with
+# deploy/Dockerfile's ARG defaults: the snapshot date must be >= the pinned base images' build
+# dates so apt only ever upgrades their pre-installed packages, never downgrades them (a stale
+# snapshot vs a fresher base image is what triggers "held broken packages").
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 : "${SOURCE_DATE_EPOCH:=1700000000}"
-: "${DEBIAN_SNAPSHOT:=20240701T000000Z}"
+: "${DEBIAN_SNAPSHOT:=20260615T000000Z}"
 RUST_VERSION="${RUST_VERSION:-1.89.0}"
-RUST_DIGEST="${RUST_DIGEST:-}"
-RUNTIME_DIGEST="${RUNTIME_DIGEST:-}"
+RUST_DIGEST="${RUST_DIGEST:-@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff}"
+RUNTIME_DIGEST="${RUNTIME_DIGEST:-@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df}"
 export SOURCE_DATE_EPOCH
 
 if ! docker buildx version >/dev/null 2>&1; then

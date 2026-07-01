@@ -29,7 +29,7 @@
 #   deploy/guest/build-guest.sh [--log transparency.log]
 # Environment (optional):
 #   SOURCE_DATE_EPOCH  fixed build epoch (default 1700000000)
-#   DEBIAN_SNAPSHOT    Debian snapshot (default 20240701T000000Z)
+#   DEBIAN_SNAPSHOT    Debian snapshot (default 20260615T000000Z)
 #   IMAGE_TAG          local OCI tag for the rootfs export (default secgit/secgit-server:m7)
 #   SECGIT_SB_KEY      PEM private key to sign the UKI (SecureBoot); unset => unsigned dev UKI
 #   SECGIT_SB_CERT     X.509 cert matching SECGIT_SB_KEY
@@ -44,7 +44,7 @@ manifest="$repo_root/image-manifest.json"
 reference="$repo_root/snp-reference.json"
 
 : "${SOURCE_DATE_EPOCH:=1700000000}"
-: "${DEBIAN_SNAPSHOT:=20240701T000000Z}"
+: "${DEBIAN_SNAPSHOT:=20260615T000000Z}"
 : "${IMAGE_TAG:=secgit/secgit-server:m7}"
 export SOURCE_DATE_EPOCH DEBIAN_SNAPSHOT
 
