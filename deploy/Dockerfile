@@ -37,9 +37,13 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     RUSTFLAGS="--remap-path-prefix=/src=/secgit --remap-path-prefix=/usr/local/cargo=/cargo"
 # Freeze apt to the Debian snapshot, then install the C toolchain aws-lc-rs needs.
 # `Check-Valid-Until false` is required because snapshot repos have stale Release dates.
+# NOTE: the snapshot is fetched over plain HTTP on purpose. apt authenticity comes from the
+# GPG-signed InRelease verified against the `Signed-By` debian-archive-keyring — NOT from TLS —
+# so HTTP is safe and byte-identical for reproducibility, and it avoids a ca-certificates
+# bootstrap in the minimal runtime stage (debian:bookworm-slim ships no CA bundle).
 RUN set -eux; \
-    printf 'Types: deb\nURIs: https://snapshot.debian.org/archive/debian/%s/\nSuites: bookworm\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian.sources; \
-    printf 'Types: deb\nURIs: https://snapshot.debian.org/archive/debian-security/%s/\nSuites: bookworm-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian-security.sources; \
+    printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s/\nSuites: bookworm\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian.sources; \
+    printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s/\nSuites: bookworm-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian-security.sources; \
     rm -f /etc/apt/sources.list; \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until; \
     apt-get update; \
@@ -68,9 +72,12 @@ FROM debian:bookworm-slim${RUNTIME_DIGEST} AS runtime
 ARG SOURCE_DATE_EPOCH
 ARG DEBIAN_SNAPSHOT
 # The forge uses canonical git as its pack engine (gitoxide can't serve receive-pack).
+# HTTP (not HTTPS) on purpose: this minimal image has no ca-certificates yet, and apt trust is
+# GPG-based (Signed-By), so HTTP both works and stays reproducible. The ca-certificates package
+# installed just below is what the server later uses for its own OUTBOUND HTTPS (AMD KDS / KBS).
 RUN set -eux; \
-    printf 'Types: deb\nURIs: https://snapshot.debian.org/archive/debian/%s/\nSuites: bookworm\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian.sources; \
-    printf 'Types: deb\nURIs: https://snapshot.debian.org/archive/debian-security/%s/\nSuites: bookworm-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian-security.sources; \
+    printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s/\nSuites: bookworm\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian.sources; \
+    printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s/\nSuites: bookworm-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list.d/debian-security.sources; \
     rm -f /etc/apt/sources.list; \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until; \
     apt-get update; \
